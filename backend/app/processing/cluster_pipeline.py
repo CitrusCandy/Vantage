@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.telemetry import PipelineTimingTracker
 from app.database.models import ClusterRun, RawData, Topic
 from app.processing.clustering import ClusterResult, HDBSCANClusterer
 from app.processing.embeddings import BaseEmbeddingProvider, get_embedding_provider
@@ -39,13 +40,15 @@ class ClusterPipeline:
             topic.title,
             min_volume_threshold,
         )
+        tracker = PipelineTimingTracker("cluster_pipeline")
 
         # 1. Run Step 2 Discourse Preprocessing and Deduplication
-        proc_result: ProcessingResult = self.processor.process_topic_items(
-            topic=topic,
-            db=db,
-            min_volume_override=min_volume_threshold,
-        )
+        with tracker.track("deduplication_and_filtering"):
+            proc_result: ProcessingResult = self.processor.process_topic_items(
+                topic=topic,
+                db=db,
+                min_volume_override=min_volume_threshold,
+            )
 
         usable_items = proc_result.usable_items
 
@@ -72,42 +75,41 @@ class ClusterPipeline:
                 "noise_count": 0,
                 "cluster_sizes": {},
                 "clusters": [],
+                "timings": tracker.get_summary(),
             }
 
         # 3. Extract text content
         texts = [item.text_content for item in usable_items]
 
         # 4. Generate Embeddings
-        logger.info(
-            "Generating embeddings for %d usable items using %s",
-            len(texts),
-            self.embedding_provider.model_name,
-        )
-        embeddings = self.embedding_provider.embed_texts(texts)
+        with tracker.track("embedding_generation", text_count=len(texts), provider=self.embedding_provider.model_name):
+            embeddings = self.embedding_provider.embed_texts(texts)
 
         # 5. Execute HDBSCAN Clustering
-        cluster_result: ClusterResult = self.clusterer.fit_predict(
-            embeddings=embeddings,
-            min_cluster_size_override=min_cluster_size,
-        )
+        with tracker.track("hdbscan_clustering", sample_count=len(usable_items)):
+            cluster_result: ClusterResult = self.clusterer.fit_predict(
+                embeddings=embeddings,
+                min_cluster_size_override=min_cluster_size,
+            )
 
         # 6. Persist ClusterRun record
-        cluster_run = ClusterRun(
-            topic_id=topic.id,
-            cluster_algorithm="hdbscan",
-            cluster_count=cluster_result.cluster_count,
-            sample_size=len(usable_items),
-            run_at=datetime.utcnow(),
-        )
-        db.add(cluster_run)
+        with tracker.track("persistence"):
+            cluster_run = ClusterRun(
+                topic_id=topic.id,
+                cluster_algorithm="hdbscan",
+                cluster_count=cluster_result.cluster_count,
+                sample_size=len(usable_items),
+                run_at=datetime.utcnow(),
+            )
+            db.add(cluster_run)
 
-        # Update Topic metadata
-        topic.last_clustered_at = datetime.utcnow()
-        topic.updated_at = datetime.utcnow()
+            # Update Topic metadata
+            topic.last_clustered_at = datetime.utcnow()
+            topic.updated_at = datetime.utcnow()
 
-        db.commit()
-        db.refresh(cluster_run)
-        db.refresh(topic)
+            db.commit()
+            db.refresh(cluster_run)
+            db.refresh(topic)
 
         # 7. Assemble Structured Cluster Payload with Representative Samples
         clusters_payload: List[Dict[str, Any]] = []
@@ -156,4 +158,5 @@ class ClusterPipeline:
             "clusters": clusters_payload,
             "statistics": proc_result.to_dict()["statistics"],
             "run_at": cluster_run.run_at.isoformat(),
+            "timings": tracker.get_summary(),
         }

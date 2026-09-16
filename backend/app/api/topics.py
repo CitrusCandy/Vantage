@@ -328,36 +328,43 @@ def run_full_pipeline(
             detail=f"Topic with slug '{slug}' not found",
         )
 
+    from app.core.telemetry import PipelineTimingTracker
+    tracker = PipelineTimingTracker("end_to_end_pipeline")
+
     # 1. Ingest & Merge
-    ingestion_pipeline = IngestionPipeline()
-    ingestion_res = ingestion_pipeline.run(topic=topic, db=db, limit_per_source=limit_per_source)
+    with tracker.track("ingestion_and_merge"):
+        ingestion_pipeline = IngestionPipeline()
+        ingestion_res = ingestion_pipeline.run(topic=topic, db=db, limit_per_source=limit_per_source)
 
     # 2. HDBSCAN Cluster
-    cluster_pipeline = ClusterPipeline()
-    cluster_res = cluster_pipeline.run_for_topic(
-        topic=topic,
-        db=db,
-        min_volume_threshold=min_volume_threshold,
-    )
+    with tracker.track("hdbscan_clustering"):
+        cluster_pipeline = ClusterPipeline()
+        cluster_res = cluster_pipeline.run_for_topic(
+            topic=topic,
+            db=db,
+            min_volume_threshold=min_volume_threshold,
+        )
 
     # 3. LLM Synthesis
     synthesis_res = None
     if cluster_res.get("status") == "success":
-        perspective_pipeline = PerspectivePipeline()
-        synthesis_res = perspective_pipeline.run_synthesis_for_topic(
-            topic=topic,
-            db=db,
-            min_volume_threshold=min_volume_threshold,
-            cluster_data=cluster_res,
-        )
+        with tracker.track("llm_perspective_synthesis"):
+            perspective_pipeline = PerspectivePipeline()
+            synthesis_res = perspective_pipeline.run_synthesis_for_topic(
+                topic=topic,
+                db=db,
+                min_volume_threshold=min_volume_threshold,
+                cluster_data=cluster_res,
+            )
 
     # 4. Refresh trending score
-    from app.workers.trending import TrendingScorer
-    scorer = TrendingScorer()
-    score_breakdown = scorer.calculate_topic_score(topic=topic, db=db)
-    topic.trending_score = score_breakdown.final_score
-    db.commit()
-    db.refresh(topic)
+    with tracker.track("trending_score_recalculation"):
+        from app.workers.trending import TrendingScorer
+        scorer = TrendingScorer()
+        score_breakdown = scorer.calculate_topic_score(topic=topic, db=db)
+        topic.trending_score = score_breakdown.final_score
+        db.commit()
+        db.refresh(topic)
 
     return {
         "status": "success",
@@ -372,5 +379,6 @@ def run_full_pipeline(
         "ingestion": ingestion_res,
         "clustering": cluster_res,
         "synthesis": synthesis_res,
+        "timings": tracker.get_summary(),
     }
 

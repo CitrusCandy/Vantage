@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.telemetry import PipelineTimingTracker
 from app.database.models import Perspective, Topic
 from app.llm.perspective import (
     BasePerspectiveSynthesizer,
@@ -43,14 +44,16 @@ class PerspectivePipeline:
             topic.id,
             topic.title,
         )
+        tracker = PipelineTimingTracker("perspective_pipeline")
 
         # 1. Ensure Clustering Exists
         if not cluster_data:
-            cluster_data = self.cluster_pipeline.run_for_topic(
-                topic=topic,
-                db=db,
-                min_volume_threshold=min_volume_threshold,
-            )
+            with tracker.track("upstream_clustering"):
+                cluster_data = self.cluster_pipeline.run_for_topic(
+                    topic=topic,
+                    db=db,
+                    min_volume_threshold=min_volume_threshold,
+                )
 
         if cluster_data.get("status") == "insufficient_volume":
             logger.warning(
@@ -65,80 +68,82 @@ class PerspectivePipeline:
                 "sample_size": cluster_data.get("sample_size", 0),
                 "perspectives": [],
                 "confidence_note": "Synthesis halted due to insufficient sample volume.",
+                "timings": tracker.get_summary(),
             }
 
         raw_clusters = cluster_data.get("clusters", [])
         total_sample_size = cluster_data.get("sample_size", 0)
 
         # 2. Filter & Trim Representative Samples for Token Control
-        # Sort clusters by size descending
-        sorted_clusters = sorted(raw_clusters, key=lambda c: c.get("size", 0), reverse=True)
+        with tracker.track("representative_sample_preparation"):
+            sorted_clusters = sorted(raw_clusters, key=lambda c: c.get("size", 0), reverse=True)
+            top_clusters = sorted_clusters[: self.max_top_clusters]
+            remaining_clusters = sorted_clusters[self.max_top_clusters :]
 
-        top_clusters = sorted_clusters[: self.max_top_clusters]
-        remaining_clusters = sorted_clusters[self.max_top_clusters :]
+            prepared_clusters: List[Dict[str, Any]] = []
+            for cluster in top_clusters:
+                samples = cluster.get("representative_samples", [])
+                trimmed_samples = samples[: self.max_samples_per_cluster]
+                prepared_clusters.append({
+                    "cluster_id": cluster.get("cluster_id"),
+                    "size": cluster.get("size"),
+                    "share": cluster.get("share"),
+                    "representative_samples": trimmed_samples,
+                })
 
-        prepared_clusters: List[Dict[str, Any]] = []
-        for cluster in top_clusters:
-            samples = cluster.get("representative_samples", [])
-            trimmed_samples = samples[: self.max_samples_per_cluster]
-            prepared_clusters.append({
-                "cluster_id": cluster.get("cluster_id"),
-                "size": cluster.get("size"),
-                "share": cluster.get("share"),
-                "representative_samples": trimmed_samples,
-            })
-
-        # Merge tiny/residual clusters into other/misc if needed
-        if remaining_clusters:
-            other_size = sum(c.get("size", 0) for c in remaining_clusters)
-            other_samples: List[Dict[str, Any]] = []
-            for c in remaining_clusters:
-                other_samples.extend(c.get("representative_samples", []))
-            prepared_clusters.append({
-                "cluster_id": "other_misc",
-                "size": other_size,
-                "share": round(other_size / max(total_sample_size, 1), 4),
-                "representative_samples": other_samples[: self.max_samples_per_cluster],
-            })
+            # Merge tiny/residual clusters into other/misc if needed
+            if remaining_clusters:
+                other_size = sum(c.get("size", 0) for c in remaining_clusters)
+                other_samples: List[Dict[str, Any]] = []
+                for c in remaining_clusters:
+                    other_samples.extend(c.get("representative_samples", []))
+                prepared_clusters.append({
+                    "cluster_id": "other_misc",
+                    "size": other_size,
+                    "share": round(other_size / max(total_sample_size, 1), 4),
+                    "representative_samples": other_samples[: self.max_samples_per_cluster],
+                })
 
         # 3. Call LLM Synthesizer
-        logger.info(
-            "Invoking LLM synthesizer for topic '%s' with %d clusters",
-            topic.title,
-            len(prepared_clusters),
-        )
-        synthesis_output: PerspectiveSynthesisOutput = self.synthesizer.synthesize(
-            topic_title=topic.title,
-            cluster_payloads=prepared_clusters,
-            total_sample_size=total_sample_size,
-        )
+        with tracker.track("llm_structured_inference", cluster_count=len(prepared_clusters)):
+            logger.info(
+                "Invoking LLM synthesizer for topic '%s' with %d clusters",
+                topic.title,
+                len(prepared_clusters),
+            )
+            synthesis_output: PerspectiveSynthesisOutput = self.synthesizer.synthesize(
+                topic_title=topic.title,
+                cluster_payloads=prepared_clusters,
+                total_sample_size=total_sample_size,
+            )
 
         # 4. Idempotently Replace Stale Perspectives for Topic
-        db.query(Perspective).filter(Perspective.topic_id == topic.id).delete()
+        with tracker.track("perspective_persistence"):
+            db.query(Perspective).filter(Perspective.topic_id == topic.id).delete()
 
-        persisted_perspectives: List[Perspective] = []
-        for p in synthesis_output.perspectives:
-            summary_points_payload = {
-                "summary": p.summary,
-                "key_arguments": p.key_arguments,
-            }
-            sample_quotes_payload = [q.model_dump() for q in p.sample_quotes]
+            persisted_perspectives: List[Perspective] = []
+            for p in synthesis_output.perspectives:
+                summary_points_payload = {
+                    "summary": p.summary,
+                    "key_arguments": p.key_arguments,
+                }
+                sample_quotes_payload = [q.model_dump() for q in p.sample_quotes]
 
-            record = Perspective(
-                topic_id=topic.id,
-                perspective_type=p.type,
-                estimated_share=p.estimated_share,
-                summary_points=summary_points_payload,
-                sample_quotes=sample_quotes_payload,
-                confidence_note=synthesis_output.confidence_note,
-                generated_at=datetime.utcnow(),
-            )
-            db.add(record)
-            persisted_perspectives.append(record)
+                record = Perspective(
+                    topic_id=topic.id,
+                    perspective_type=p.type,
+                    estimated_share=p.estimated_share,
+                    summary_points=summary_points_payload,
+                    sample_quotes=sample_quotes_payload,
+                    confidence_note=synthesis_output.confidence_note,
+                    generated_at=datetime.utcnow(),
+                )
+                db.add(record)
+                persisted_perspectives.append(record)
 
-        topic.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(topic)
+            topic.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(topic)
 
         logger.info(
             "Persisted %d perspectives for Topic ID %d ('%s')",
@@ -166,4 +171,5 @@ class PerspectivePipeline:
                 }
                 for rec in persisted_perspectives
             ],
+            "timings": tracker.get_summary(),
         }

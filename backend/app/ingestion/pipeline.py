@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.telemetry import PipelineTimingTracker
 from app.database.models import Topic
 from app.ingestion.google_news import GoogleNewsIngestor
 from app.ingestion.merge_pipeline import MergePipeline
@@ -42,35 +43,38 @@ class IngestionPipeline:
             topic.id,
             topic.title,
         )
+        tracker = PipelineTimingTracker("ingestion_pipeline")
 
         staging_counts: Dict[str, int] = {}
         staging_errors: Dict[str, str] = {}
 
         # 1. Independent Scrapers Fan-Out to Staging Tables
-        tasks = [
-            ("google_news", lambda: self.google_news_ingestor.fetch_and_stage(topic, db, limit=limit_per_source, timeout_seconds=per_source_timeout)),
-            ("reddit", lambda: self.reddit_ingestor.fetch_and_stage(topic, db, limit=limit_per_source, timeout_seconds=per_source_timeout)),
-            ("x", lambda: self.x_scraper.fetch_and_stage(topic, db, limit=limit_per_source, timeout_seconds=per_source_timeout)),
-        ]
+        with tracker.track("fanout_staging_ingestion", limit_per_source=limit_per_source):
+            tasks = [
+                ("google_news", lambda: self.google_news_ingestor.fetch_and_stage(topic, db, limit=limit_per_source, timeout_seconds=per_source_timeout)),
+                ("reddit", lambda: self.reddit_ingestor.fetch_and_stage(topic, db, limit=limit_per_source, timeout_seconds=per_source_timeout)),
+                ("x", lambda: self.x_scraper.fetch_and_stage(topic, db, limit=limit_per_source, timeout_seconds=per_source_timeout)),
+            ]
 
-        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-            future_to_source = {executor.submit(fn): name for name, fn in tasks}
-            for future in as_completed(future_to_source):
-                source_name = future_to_source[future]
-                try:
-                    records = future.result()
-                    staging_counts[source_name] = len(records)
-                except Exception as e:
-                    staging_errors[source_name] = str(e)
-                    staging_counts[source_name] = 0
-                    logger.error("Scraper failed for [%s]: %s", source_name, str(e))
+            with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                future_to_source = {executor.submit(fn): name for name, fn in tasks}
+                for future in as_completed(future_to_source):
+                    source_name = future_to_source[future]
+                    try:
+                        records = future.result()
+                        staging_counts[source_name] = len(records)
+                    except Exception as e:
+                        staging_errors[source_name] = str(e)
+                        staging_counts[source_name] = 0
+                        logger.error("Scraper failed for [%s]: %s", source_name, str(e))
 
         # Increment topic search count
         topic.search_count = (topic.search_count or 0) + 1
         db.commit()
 
         # 2. Merge Stage: Staging Tables -> combined_raw_data
-        merge_result = self.merge_pipeline.merge_topic_staging_data(topic=topic, db=db)
+        with tracker.track("merge_and_normalization"):
+            merge_result = self.merge_pipeline.merge_topic_staging_data(topic=topic, db=db)
 
         return {
             "topic_id": topic.id,
@@ -78,4 +82,5 @@ class IngestionPipeline:
             "staging_counts": staging_counts,
             "staging_errors": staging_errors,
             "merge_result": merge_result,
+            "timings": tracker.get_summary(),
         }
