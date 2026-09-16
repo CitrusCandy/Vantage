@@ -332,7 +332,7 @@ def run_full_pipeline(
         )
 
     from app.core.telemetry import PipelineTimingTracker
-    tracker = PipelineTimingTracker("end_to_end_pipeline")
+    tracker = PipelineTimingTracker("end_to_end_pipeline", topic_slug=slug)
 
     # 1. Ingest & Merge
     with tracker.track("ingestion_and_merge"):
@@ -369,6 +369,8 @@ def run_full_pipeline(
         db.commit()
         db.refresh(topic)
 
+    timings_summary = tracker.finish(status="success")
+
     return {
         "status": "success",
         "topic": {
@@ -382,6 +384,6 @@ def run_full_pipeline(
         "ingestion": ingestion_res,
         "clustering": cluster_res,
         "synthesis": synthesis_res,
-        "timings": tracker.get_summary(),
+        "timings": timings_summary,
     }
 

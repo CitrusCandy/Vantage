@@ -1,4 +1,14 @@
-import { CandidateTopic, Perspective, Topic, TopicCreate, WorkerStatus } from "./types";
+import {
+  CandidateTopic,
+  OpsOverview,
+  OpsPipelineMetrics,
+  OpsSourceHealth,
+  OpsWorkerMetrics,
+  Perspective,
+  Topic,
+  TopicCreate,
+  WorkerStatus,
+} from "./types";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL ||
@@ -94,5 +104,52 @@ export async function discoverCandidateTrends(limitPerProvider: number = 10): Pr
 }> {
   return fetchJson(`/workers/discover-trends?limit_per_provider=${limitPerProvider}`, {
     method: "POST",
+  });
+}
+
+// ==========================================
+// Operational & Observability APIs
+// ==========================================
+
+export async function getOpsOverview(): Promise<OpsOverview> {
+  return fetchJson<OpsOverview>("/ops/overview");
+}
+
+export async function getOpsPipelineMetrics(): Promise<OpsPipelineMetrics> {
+  return fetchJson<OpsPipelineMetrics>("/ops/pipeline-metrics");
+}
+
+export async function getOpsSourceHealth(): Promise<OpsSourceHealth> {
+  return fetchJson<OpsSourceHealth>("/ops/source-health");
+}
+
+export async function getOpsWorkerMetrics(): Promise<OpsWorkerMetrics> {
+  return fetchJson<OpsWorkerMetrics>("/ops/worker-metrics");
+}
+
+export async function triggerOpsTrending(apiKey?: string): Promise<any> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["X-Ops-Key"] = apiKey;
+  return fetchJson("/ops/run-trending", {
+    method: "POST",
+    headers,
+  });
+}
+
+export async function triggerOpsRefreshTopic(slug: string, apiKey?: string): Promise<any> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["X-Ops-Key"] = apiKey;
+  return fetchJson(`/ops/refresh-topic/${encodeURIComponent(slug)}`, {
+    method: "POST",
+    headers,
+  });
+}
+
+export async function triggerOpsReprocessTopic(slug: string, apiKey?: string): Promise<any> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["X-Ops-Key"] = apiKey;
+  return fetchJson(`/ops/reprocess-topic/${encodeURIComponent(slug)}`, {
+    method: "POST",
+    headers,
   });
 }

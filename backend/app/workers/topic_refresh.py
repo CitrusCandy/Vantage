@@ -161,3 +161,46 @@ class TopicRefreshWorker:
             len(summary.skipped_stagnant_topics),
         )
         return summary
+
+    def refresh_topic(
+        self,
+        topic: Topic,
+        db: Session,
+        min_volume_threshold: int = 30,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Refresh a single topic: score update, ingestion, clustering, and synthesis."""
+        score_info = self.scorer.calculate_topic_score(topic=topic, db=db)
+        topic.trending_score = score_info.final_score
+
+        # 1. Ingestion
+        ingest_res = self.ingestion_pipeline.run(topic=topic, db=db)
+
+        # 2. Clustering
+        cluster_res = self.cluster_pipeline.run_for_topic(
+            topic=topic,
+            db=db,
+            min_volume_threshold=min_volume_threshold,
+        )
+
+        # 3. Perspective Synthesis
+        synthesis_res = None
+        if cluster_res.get("status") == "success":
+            synthesis_res = self.perspective_pipeline.run_synthesis_for_topic(
+                topic=topic,
+                db=db,
+                min_volume_threshold=min_volume_threshold,
+                cluster_data=cluster_res,
+            )
+
+        db.commit()
+        db.refresh(topic)
+
+        return {
+            "status": "success",
+            "topic_slug": topic.slug,
+            "trending_score": topic.trending_score,
+            "ingestion": ingest_res,
+            "clustering": cluster_res,
+            "synthesis": synthesis_res,
+        }

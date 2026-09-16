@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.ops import router as ops_router
 from app.api.topics import router as topics_router
 from app.api.workers import router as workers_router
 from app.database.database import Base, engine
@@ -61,6 +62,7 @@ async def add_process_time_and_log_middleware(request: Request, call_next):
 
 app.include_router(topics_router, prefix="/api")
 app.include_router(workers_router, prefix="/api")
+app.include_router(ops_router, prefix="/api")
 
 
 @app.get("/health")

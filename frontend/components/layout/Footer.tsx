@@ -65,6 +65,11 @@ export const Footer: React.FC = () => {
                 </a>
               </li>
               <li>
+                <Link href="/ops" className="text-indigo-400 hover:text-indigo-300 transition-colors font-medium flex items-center gap-1">
+                  Ops Dashboard
+                </Link>
+              </li>
+              <li>
                 <span className="text-slate-500">API: FastAPI (Async)</span>
               </li>
               <li>

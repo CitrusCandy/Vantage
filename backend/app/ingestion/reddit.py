@@ -2,6 +2,7 @@ from datetime import datetime
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -10,6 +11,7 @@ from typing import List, Optional
 import praw
 from sqlalchemy.orm import Session
 
+from app.core.telemetry import ops_metrics
 from app.database.models import RawReddit, Topic
 
 logger = logging.getLogger("app.ingestion.reddit")
@@ -118,11 +120,23 @@ class RedditIngestor:
         url = f"https://www.reddit.com/search.json?{params}"
         req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
 
+        t_start = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
                 raw_json = resp.read().decode("utf-8")
-                return self.parse_json_and_persist(raw_json, topic_id=topic.id, db=db, limit=limit)
+            latency_ms = (time.perf_counter() - t_start) * 1000.0
+            ops_metrics.record_source_execution("reddit", success=True, latency_ms=latency_ms)
+            return self.parse_json_and_persist(raw_json, topic_id=topic.id, db=db, limit=limit)
         except Exception as e:
+            latency_ms = (time.perf_counter() - t_start) * 1000.0
+            is_to = "timed out" in str(e).lower()
+            ops_metrics.record_source_execution(
+                "reddit",
+                success=False,
+                latency_ms=latency_ms,
+                is_timeout=is_to,
+                error_summary=str(e)[:100],
+            )
             logger.error("[reddit] Public REST fallback error for '%s': %s", topic.title, str(e))
             return []
 

@@ -2,11 +2,13 @@ from abc import ABC, abstractmethod
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 import urllib.error
 import urllib.request
 
 from app.core.security import sanitize_url
+from app.core.telemetry import ops_metrics
 from app.llm.schemas import (
     PerspectiveItem,
     PerspectiveSynthesisOutput,
@@ -113,6 +115,7 @@ Instructions:
             },
         )
 
+        t_start = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
@@ -123,15 +126,24 @@ Instructions:
                 for p in raw_output.perspectives:
                     for q in p.sample_quotes:
                         q.url = sanitize_url(q.url)
+                latency_ms = (time.perf_counter() - t_start) * 1000.0
+                ops_metrics.record_source_execution("openai", success=True, latency_ms=latency_ms)
                 return raw_output
         except urllib.error.HTTPError as e:
+            latency_ms = (time.perf_counter() - t_start) * 1000.0
             err_body = e.read().decode("utf-8", errors="ignore")
+            ops_metrics.record_source_execution("openai", success=False, latency_ms=latency_ms, error_summary=f"HTTP {e.code}")
             logger.error("OpenAI Chat Completion error HTTP %d: %s", e.code, err_body)
             raise RuntimeError(f"OpenAI Perspective API error HTTP {e.code}: {err_body}") from e
         except urllib.error.URLError as e:
+            latency_ms = (time.perf_counter() - t_start) * 1000.0
+            is_to = "timed out" in str(e).lower()
+            ops_metrics.record_source_execution("openai", success=False, latency_ms=latency_ms, is_timeout=is_to, error_summary=str(e)[:100])
             logger.error("OpenAI connection failed: %s", str(e))
             raise RuntimeError(f"OpenAI connection error: {str(e)}") from e
         except json.JSONDecodeError as e:
+            latency_ms = (time.perf_counter() - t_start) * 1000.0
+            ops_metrics.record_source_execution("openai", success=False, latency_ms=latency_ms, error_summary="Malformed JSON")
             logger.error("Failed to parse JSON response from LLM: %s", str(e))
             raise RuntimeError(f"Malformed JSON from LLM: {str(e)}") from e
 
@@ -242,7 +254,7 @@ def get_perspective_synthesizer(
     provider_type: Optional[str] = None,
 ) -> BasePerspectiveSynthesizer:
     """Factory for active LLM perspective synthesizer."""
-    ptype = (provider_type or os.getenv("LLM_PROVIDER", "openai")).lower()
-    if ptype == "mock":
+    ptype = (provider_type or os.getenv("LLM_PROVIDER", "")).lower()
+    if ptype == "mock" or (not ptype and not os.getenv("OPENAI_API_KEY")):
         return MockPerspectiveSynthesizer()
     return OpenAIPerspectiveSynthesizer()

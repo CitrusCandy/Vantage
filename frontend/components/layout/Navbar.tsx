@@ -69,6 +69,13 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCreateModal }) => {
             <Layers className="w-3.5 h-3.5 text-slate-400" />
             All Topics
           </Link>
+          <Link
+            href="/ops"
+            className="px-3.5 py-1.5 text-xs font-medium text-slate-300 hover:text-white hover:bg-white/[0.06] rounded-lg transition-colors flex items-center gap-1.5"
+          >
+            <Activity className="w-3.5 h-3.5 text-emerald-400" />
+            Operations
+          </Link>
         </nav>
 
         {/* Right Action Items */}

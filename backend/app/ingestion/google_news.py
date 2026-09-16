@@ -4,13 +4,14 @@ import html
 import logging
 import re
 import urllib.parse
-import urllib.request
+import time
 from typing import List, Optional
 
 import feedparser
 from sqlalchemy.orm import Session
 
 from app.core.security import sanitize_url
+from app.core.telemetry import ops_metrics
 from app.database.models import RawGoogleNews, Topic
 
 logger = logging.getLogger("app.ingestion.google_news")
@@ -60,10 +61,22 @@ class GoogleNewsIngestor:
         }
         req = urllib.request.Request(rss_url, headers=headers)
 
+        t_start = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
                 content = response.read()
+            latency_ms = (time.perf_counter() - t_start) * 1000.0
+            ops_metrics.record_source_execution("google_news", success=True, latency_ms=latency_ms)
         except Exception as e:
+            latency_ms = (time.perf_counter() - t_start) * 1000.0
+            is_to = "timed out" in str(e).lower()
+            ops_metrics.record_source_execution(
+                "google_news",
+                success=False,
+                latency_ms=latency_ms,
+                is_timeout=is_to,
+                error_summary=str(e)[:100],
+            )
             logger.error("[google_news] Failed fetching RSS for '%s': %s", topic.title, str(e))
             return []
 

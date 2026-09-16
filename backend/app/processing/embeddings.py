@@ -141,7 +141,7 @@ def get_embedding_provider(
     provider_type: Optional[str] = None,
 ) -> BaseEmbeddingProvider:
     """Factory for obtaining the active embedding provider."""
-    ptype = provider_type or os.getenv("EMBEDDING_PROVIDER", "openai").lower()
-    if ptype == "mock":
+    ptype = (provider_type or os.getenv("EMBEDDING_PROVIDER", "")).lower()
+    if ptype == "mock" or (not ptype and not os.getenv("OPENAI_API_KEY")):
         return MockEmbeddingProvider()
     return OpenAIEmbeddingProvider()
