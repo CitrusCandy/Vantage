@@ -307,3 +307,70 @@ def synthesize_topic_perspectives(
         db=db,
         min_volume_threshold=min_volume_threshold,
     )
+
+
+@router.post(
+    "/{slug}/run-pipeline",
+    status_code=status.HTTP_200_OK,
+    summary="Execute complete end-to-end pipeline (Ingest -> Merge -> Cluster -> Synthesize)",
+)
+def run_full_pipeline(
+    slug: str,
+    limit_per_source: int = Query(default=50, ge=1, le=100),
+    min_volume_threshold: int = Query(default=30, ge=2),
+    db: Session = Depends(get_db),
+):
+    """Execute complete end-to-end pipeline: Ingestion into staging -> Merge into combined_raw_data -> HDBSCAN clustering -> LLM synthesis."""
+    topic = db.query(Topic).filter(Topic.slug == slug).first()
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Topic with slug '{slug}' not found",
+        )
+
+    # 1. Ingest & Merge
+    ingestion_pipeline = IngestionPipeline()
+    ingestion_res = ingestion_pipeline.run(topic=topic, db=db, limit_per_source=limit_per_source)
+
+    # 2. HDBSCAN Cluster
+    cluster_pipeline = ClusterPipeline()
+    cluster_res = cluster_pipeline.run_for_topic(
+        topic=topic,
+        db=db,
+        min_volume_threshold=min_volume_threshold,
+    )
+
+    # 3. LLM Synthesis
+    synthesis_res = None
+    if cluster_res.get("status") == "success":
+        perspective_pipeline = PerspectivePipeline()
+        synthesis_res = perspective_pipeline.run_synthesis_for_topic(
+            topic=topic,
+            db=db,
+            min_volume_threshold=min_volume_threshold,
+            cluster_data=cluster_res,
+        )
+
+    # 4. Refresh trending score
+    from app.workers.trending import TrendingScorer
+    scorer = TrendingScorer()
+    score_breakdown = scorer.calculate_topic_score(topic=topic, db=db)
+    topic.trending_score = score_breakdown.final_score
+    db.commit()
+    db.refresh(topic)
+
+    return {
+        "status": "success",
+        "topic": {
+            "id": topic.id,
+            "slug": topic.slug,
+            "title": topic.title,
+            "trending_score": topic.trending_score,
+            "source_coverage": topic.source_coverage,
+            "perspectives_count": len(topic.perspectives) if topic.perspectives else 0,
+        },
+        "ingestion": ingestion_res,
+        "clustering": cluster_res,
+        "synthesis": synthesis_res,
+    }
+

@@ -37,8 +37,8 @@ class PerspectiveResponse(BaseModel):
     topic_id: int
     perspective_type: str
     estimated_share: Optional[float] = None
-    summary_points: Optional[List[str]] = None
-    sample_quotes: Optional[List[Dict[str, Any]]] = None
+    summary_points: Optional[Any] = None
+    sample_quotes: Optional[Any] = None
     confidence_note: Optional[str] = None
     generated_at: datetime
 
