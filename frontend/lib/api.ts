@@ -169,3 +169,28 @@ export async function triggerOpsAlertEvaluate(apiKey?: string): Promise<AlertSum
   });
 }
 
+export async function getOpsHistory(params?: {
+  type?: string;
+  component?: string;
+  status?: string;
+  topic_slug?: string;
+  start_time?: string;
+  end_time?: string;
+  page?: number;
+  limit?: number;
+}): Promise<import("./types").OpsHistoryResponse> {
+  const queryParts: string[] = [];
+  if (params?.type) queryParts.push(`type=${encodeURIComponent(params.type)}`);
+  if (params?.component) queryParts.push(`component=${encodeURIComponent(params.component)}`);
+  if (params?.status) queryParts.push(`status=${encodeURIComponent(params.status)}`);
+  if (params?.topic_slug) queryParts.push(`topic_slug=${encodeURIComponent(params.topic_slug)}`);
+  if (params?.start_time) queryParts.push(`start_time=${encodeURIComponent(params.start_time)}`);
+  if (params?.end_time) queryParts.push(`end_time=${encodeURIComponent(params.end_time)}`);
+  if (params?.page) queryParts.push(`page=${params.page}`);
+  if (params?.limit) queryParts.push(`limit=${params.limit}`);
+
+  const qs = queryParts.length > 0 ? `?${queryParts.join("&")}` : "";
+  return fetchJson<import("./types").OpsHistoryResponse>(`/ops/history${qs}`);
+}
+
+

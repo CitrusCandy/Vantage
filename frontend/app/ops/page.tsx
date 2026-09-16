@@ -10,10 +10,14 @@ import {
   Bell,
   BellRing,
   CheckCircle,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Cpu,
   Database,
+  Filter,
   Globe,
+  History,
   Info,
   Key,
   Layers,
@@ -31,6 +35,7 @@ import {
 
 import {
   getOpsAlerts,
+  getOpsHistory,
   getOpsOverview,
   getOpsPipelineMetrics,
   getOpsSourceHealth,
@@ -45,6 +50,8 @@ import {
   AlertSeverity,
   AlertSummary,
   HealthState,
+  OpsHistoryItem,
+  OpsHistoryResponse,
   OpsOverview,
   OpsPipelineMetrics,
   OpsSourceHealth,
@@ -66,6 +73,13 @@ export default function OperationsPage() {
   const [opsApiKey, setOpsApiKey] = useState<string>("");
   const [showKeyInput, setShowKeyInput] = useState<boolean>(false);
   const [showAlertHistory, setShowAlertHistory] = useState<boolean>(false);
+
+  // Operational History / Audit State
+  const [historyResponse, setHistoryResponse] = useState<OpsHistoryResponse | null>(null);
+  const [historyType, setHistoryType] = useState<string>("all");
+  const [historyStatus, setHistoryStatus] = useState<string>("");
+  const [historyPage, setHistoryPage] = useState<number>(1);
+  const [isHistoryLoading, setIsHistoryLoading] = useState<boolean>(false);
 
   // Control action state
   const [reprocessSlug, setReprocessSlug] = useState<string>("");
@@ -114,18 +128,40 @@ export default function OperationsPage() {
     }
   };
 
+  const loadHistory = async () => {
+    try {
+      setIsHistoryLoading(true);
+      const res = await getOpsHistory({
+        type: historyType,
+        status: historyStatus || undefined,
+        page: historyPage,
+        limit: 15,
+      });
+      setHistoryResponse(res);
+    } catch (err: any) {
+      console.error("Failed to load operations history:", err);
+    } finally {
+      setIsHistoryLoading(false);
+    }
+  };
+
   useEffect(() => {
     loadAllTelemetry();
   }, []);
+
+  useEffect(() => {
+    loadHistory();
+  }, [historyType, historyStatus, historyPage]);
 
   // Auto-refresh interval (every 10 seconds)
   useEffect(() => {
     if (!autoRefresh) return;
     const interval = setInterval(() => {
       loadAllTelemetry();
+      loadHistory();
     }, 10000);
     return () => clearInterval(interval);
-  }, [autoRefresh]);
+  }, [autoRefresh, historyType, historyStatus, historyPage]);
 
   const handleRunTrending = async () => {
     setIsActionRunning(true);
@@ -850,7 +886,267 @@ export default function OperationsPage() {
             </table>
           </div>
         </div>
+
+        {/* 5. Persistent Operational History & Auditability Log */}
+        <div className="p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <History className="w-5 h-5 text-indigo-400" />
+              <div>
+                <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                  Persistent Operational History & Audit Log
+                  {historyResponse && (
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-medium bg-white/[0.06] text-slate-300 border border-white/10">
+                      {historyResponse.total_count} records
+                    </span>
+                  )}
+                </h2>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  PostgreSQL audit history preserved across server restarts with configurable retention.
+                </p>
+              </div>
+            </div>
+
+            {/* Filter Controls */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex bg-slate-900/80 p-1 rounded-xl border border-white/[0.06] text-xs">
+                {[
+                  { id: "all", label: "All" },
+                  { id: "pipeline_runs", label: "Pipelines" },
+                  { id: "source_executions", label: "Sources" },
+                  { id: "worker_cycles", label: "Workers" },
+                  { id: "alerts", label: "Alerts" },
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => {
+                      setHistoryType(tab.id);
+                      setHistoryPage(1);
+                    }}
+                    className={`px-3 py-1 rounded-lg text-[11px] font-medium transition-all ${
+                      historyType === tab.id
+                        ? "bg-indigo-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Status filter */}
+              <select
+                value={historyStatus}
+                onChange={(e) => {
+                  setHistoryStatus(e.target.value);
+                  setHistoryPage(1);
+                }}
+                className="px-2.5 py-1.5 rounded-xl bg-slate-900 border border-white/10 text-slate-300 text-xs focus:outline-none focus:border-indigo-500"
+              >
+                <option value="">All Statuses</option>
+                <option value="success">Success</option>
+                <option value="failed">Failed</option>
+                <option value="timeout">Timeout</option>
+                <option value="active">Active</option>
+                <option value="resolved">Resolved</option>
+              </select>
+
+              <button
+                onClick={() => loadHistory()}
+                disabled={isHistoryLoading}
+                className="p-1.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-slate-300 border border-white/10 transition-colors"
+                title="Refresh audit history"
+              >
+                <RefreshCw className={`w-4 h-4 ${isHistoryLoading ? "animate-spin text-indigo-400" : ""}`} />
+              </button>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="text-[11px] text-slate-400 border-b border-white/[0.06] uppercase tracking-wider">
+                <tr>
+                  <th className="pb-3 font-medium">Type</th>
+                  <th className="pb-3 font-medium">Recorded At</th>
+                  <th className="pb-3 font-medium">Entity / Operation</th>
+                  <th className="pb-3 font-medium">Audit Metadata & Metrics</th>
+                  <th className="pb-3 font-medium text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/[0.04]">
+                {historyResponse && historyResponse.items.length > 0 ? (
+                  historyResponse.items.map((item, idx) => {
+                    const timeVal = item.started_at || item.last_seen || item.timestamp;
+                    return (
+                      <tr key={idx} className="hover:bg-white/[0.02] transition-colors">
+                        <td className="py-3">
+                          <span
+                            className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-mono font-semibold ${
+                              item.record_type === "pipeline_run"
+                                ? "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
+                                : item.record_type === "source_execution"
+                                ? "bg-cyan-500/10 text-cyan-400 border border-cyan-500/20"
+                                : item.record_type === "worker_cycle"
+                                ? "bg-purple-500/10 text-purple-400 border border-purple-500/20"
+                                : "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                            }`}
+                          >
+                            {item.record_type === "pipeline_run"
+                              ? "PIPELINE"
+                              : item.record_type === "source_execution"
+                              ? "SOURCE"
+                              : item.record_type === "worker_cycle"
+                              ? "WORKER"
+                              : "ALERT"}
+                          </span>
+                        </td>
+                        <td className="py-3 text-slate-400 font-mono text-[11px]">
+                          {timeVal ? formatTimeAgo(timeVal) : "—"}
+                        </td>
+                        <td className="py-3 text-white font-medium">
+                          {item.record_type === "pipeline_run" && (
+                            <div>
+                              <span className="font-mono text-slate-300">{item.pipeline_type}</span>
+                              {item.topic_slug && (
+                                <span className="block text-[11px] text-indigo-400 font-normal">
+                                  topic: {item.topic_slug}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                          {item.record_type === "source_execution" && (
+                            <div>
+                              <span className="font-semibold text-cyan-300">{item.source}</span>
+                              <span className="block text-[11px] text-slate-400 font-mono">
+                                op: {item.operation}
+                              </span>
+                            </div>
+                          )}
+                          {item.record_type === "worker_cycle" && (
+                            <div className="font-mono text-slate-300">
+                              Cycle #{item.cycle_id}
+                            </div>
+                          )}
+                          {item.record_type === "alert" && (
+                            <div>
+                              <span className="font-semibold text-amber-300">{item.rule_name}</span>
+                              <span className="block text-[11px] text-slate-400 font-mono">
+                                {item.component}
+                              </span>
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-3 text-slate-300">
+                          {item.record_type === "pipeline_run" && (
+                            <div className="flex flex-wrap gap-2 items-center text-[11px]">
+                              <span className="text-indigo-300 font-mono font-semibold">
+                                {item.duration_ms} ms
+                              </span>
+                              {item.sample_size !== undefined && item.sample_size > 0 && (
+                                <span className="text-slate-400">items: {item.sample_size}</span>
+                              )}
+                              {item.perspective_count !== undefined && item.perspective_count > 0 && (
+                                <span className="text-slate-400">perspectives: {item.perspective_count}</span>
+                              )}
+                              {item.error_type && (
+                                <span className="text-rose-400 truncate max-w-xs">{item.error_type}</span>
+                              )}
+                            </div>
+                          )}
+                          {item.record_type === "source_execution" && (
+                            <div className="flex flex-wrap gap-2 items-center text-[11px]">
+                              <span className="text-cyan-300 font-mono font-semibold">
+                                {item.duration_ms} ms
+                              </span>
+                              {item.item_count !== undefined && item.item_count > 0 && (
+                                <span className="text-slate-400">items: {item.item_count}</span>
+                              )}
+                              {item.error_type && (
+                                <span className="text-rose-400 truncate max-w-xs">{item.error_type}</span>
+                              )}
+                            </div>
+                          )}
+                          {item.record_type === "worker_cycle" && (
+                            <div className="flex flex-wrap gap-2 items-center text-[11px]">
+                              <span className="text-purple-300 font-mono font-semibold">
+                                {item.duration_ms} ms
+                              </span>
+                              <span className="text-slate-400">
+                                refreshed: {item.topics_refreshed}/{item.topics_considered}
+                              </span>
+                              {item.topics_failed !== undefined && item.topics_failed > 0 && (
+                                <span className="text-rose-400">failed: {item.topics_failed}</span>
+                              )}
+                            </div>
+                          )}
+                          {item.record_type === "alert" && (
+                            <div className="text-[11px] space-y-0.5">
+                              <p className="text-slate-300">{item.message}</p>
+                              <div className="flex gap-2 text-[10px] text-slate-500">
+                                <span>occurrences: {item.occurrence_count}</span>
+                                {item.resolved_at && <span>resolved: {formatTimeAgo(item.resolved_at)}</span>}
+                              </div>
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-3 text-right">
+                          <span
+                            className={`inline-flex px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                              item.status === "success" || item.status === "resolved"
+                                ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                                : item.status === "active"
+                                ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                                : item.status === "timeout"
+                                ? "bg-orange-500/10 text-orange-400 border border-orange-500/20"
+                                : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+                            }`}
+                          >
+                            {(item.status || "UNKNOWN").toUpperCase()}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })
+                ) : (
+                  <tr>
+                    <td colSpan={5} className="py-8 text-center text-slate-500 text-xs">
+                      {isHistoryLoading
+                        ? "Loading operational history from PostgreSQL..."
+                        : "No persistent operational history records found for the selected filter."}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Pagination Footer */}
+          {historyResponse && historyResponse.total_pages > 1 && (
+            <div className="flex items-center justify-between pt-4 border-t border-white/[0.06] text-xs text-slate-400">
+              <div>
+                Page {historyResponse.page} of {historyResponse.total_pages} ({historyResponse.total_count} total events)
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setHistoryPage((p) => Math.max(1, p - 1))}
+                  disabled={!historyResponse.has_prev || isHistoryLoading}
+                  className="px-3 py-1.5 rounded-xl bg-slate-900 border border-white/10 hover:bg-white/[0.04] disabled:opacity-40 transition-all flex items-center gap-1"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" /> Previous
+                </button>
+                <button
+                  onClick={() => setHistoryPage((p) => Math.min(historyResponse.total_pages, p + 1))}
+                  disabled={!historyResponse.has_next || isHistoryLoading}
+                  className="px-3 py-1.5 rounded-xl bg-slate-900 border border-white/10 hover:bg-white/[0.04] disabled:opacity-40 transition-all flex items-center gap-1"
+                >
+                  Next <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
 }
+

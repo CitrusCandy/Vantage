@@ -173,6 +173,8 @@ Services will be accessible at:
 | `ALERT_LLM_FAILURE_THRESHOLD` | Optional | `2` | Perspective LLM provider failure threshold |
 | `ALERT_X_FAILURE_THRESHOLD` | Optional | `3` | X scraper consecutive failure threshold |
 | `ALERT_MAX_RESOLVED_HISTORY` | Optional | `50` | Maximum resolved alerts kept in in-memory history |
+| `OPS_RETENTION_DAYS` | Optional | `30` | Max age in days for pipeline runs, source executions, and worker cycles |
+| `ALERT_RETENTION_DAYS` | Optional | `90` | Max age in days for resolved operational alerts |
 | `NEXT_PUBLIC_API_URL` | Optional (Frontend) | `http://localhost:8000/api` | Base URL for FastAPI backend proxy |
 
 ---
@@ -185,11 +187,30 @@ Services will be accessible at:
 - `POST /api/topics/{slug}/run-pipeline` — Execute full end-to-end flow: Ingestion $\rightarrow$ Staging $\rightarrow$ Merge $\rightarrow$ HDBSCAN Clustering $\rightarrow$ LLM Synthesis.
 - `GET /api/ops/overview` — High-level operational health, incident readiness timestamps, and alert counts.
 - `GET /api/ops/alerts` — Active alerts, severity (`info`, `warning`, `critical`), occurrence counts, and resolved history.
+- `GET /api/ops/history` — Query historical operational audit logs with filtering (`type`, `component`, `status`, `topic_slug`, `start_time`, `end_time`) and bounded pagination.
 - `POST /api/ops/alerts/evaluate` — Trigger on-demand alert evaluation pass (protected by `X-Ops-Key`).
 - `GET /api/ops/pipeline-metrics` — Multi-stage pipeline latency telemetry, median durations, and slowest stages.
 - `GET /api/ops/source-health` — Fault-isolated reliability status for Google News, Reddit, X, and OpenAI.
 - `GET /api/workers/status` — Inspect background scheduler status.
 - `POST /api/workers/refresh-trending` — Trigger background topic refresh cycle.
+
+---
+
+## Persistent Operational History & Retention
+
+### 1. Database Schema
+Operational metadata is persisted to PostgreSQL tables to survive process restarts:
+- `pipeline_runs`: Execution IDs, topic slugs, stages breakdown, sample sizes, and sanitized error types.
+- `source_executions`: Scraping durations, item yields, statuses (`success`/`failed`/`timeout`), and masked error summaries.
+- `worker_cycles`: Background scheduler cycles, topics considered/refreshed/skipped/failed.
+- `operational_alerts`: Active and historical alert states, severity, occurrence counts, and resolution timestamps.
+
+### 2. Retention Cleanup Command
+To prune expired operational records while preserving active alerts:
+```bash
+python -m app.database.cleanup_ops_history --days 30 --alerts-days 90
+```
+Use `--dry-run` to inspect candidate row counts without deleting.
 
 ---
 
@@ -214,6 +235,7 @@ Services will be accessible at:
 
 - Consecutive failures for the same `(rule_name, component)` do not flood logs or UI with duplicate records.
 - Instead, the existing active alert updates `last_seen`, increments `occurrence_count`, and refreshes metadata.
+- On server restart, active alerts are loaded from the database so occurrence counts continue incrementing properly.
 - When metrics normalize on subsequent evaluation passes, the alert is automatically marked `status = "resolved"`, stamped with `resolved_at`, and archived into `resolved_history`.
 
 ### 3. How to Manually Evaluate Alerts
@@ -249,6 +271,7 @@ pytest backend/tests/ -v
 # 4. Verify frontend production compilation
 cd frontend && npm run build
 ```
+
 
 
 

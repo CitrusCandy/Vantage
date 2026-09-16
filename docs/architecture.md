@@ -68,7 +68,20 @@ X ────────────┘
      - Verifies health probes (`/health`, `/ready`), DB ping latency, worker state, source freshness, pipeline telemetry, and runs an alert evaluation pass.
      - Returns exit code 0 when nominal; non-zero if critical failures are present.
 
-7. **Frontend Showcase & Operations Dashboard**:
+7. **Persistent Operational History & Auditability**:
+   - **PostgreSQL Operational Tables**:
+     - `pipeline_runs`: Tracks run ID, topic slug/ID, duration, sample size, cluster count, perspective count, failure stage, and sanitized error types.
+     - `source_executions`: Tracks scraper executions, operations (fetch/scrape), duration ms, item count, status (success/failed/timeout), and sanitized error types.
+     - `worker_cycles`: Tracks worker cycle ID, duration, topics considered/refreshed/skipped/failed, and status.
+     - `operational_alerts`: Persists active and historical alert records (`alert_id`, `rule_name`, `severity`, `component`, `message`, `occurrence_count`, `first_seen`, `last_seen`, `resolved_at`).
+   - **Restart Resilience**: Active alert states and occurrence counts persist across process restarts, ensuring deduplication works continuously.
+   - **Data Retention & Maintenance**:
+     - Configurable retention: `OPS_RETENTION_DAYS` (default: 30) and `ALERT_RETENTION_DAYS` (default: 90).
+     - Maintenance command: `python -m app.database.cleanup_ops_history [--days 30] [--alerts-days 90] [--dry-run]`.
+     - Only resolved alerts are purged; active alerts are always preserved until resolved.
+
+8. **Frontend Showcase & Operations Dashboard**:
    - Classy multi-perspective showcase interface.
-   - Operations dashboard (`/ops`) featuring live telemetry, active alerts panel with severity indicators, incident status cards, and manual evaluation triggers.
+   - Operations dashboard (`/ops`) featuring live telemetry, active alerts panel with severity indicators, incident status cards, manual evaluation triggers, and an audit history log with filtering and pagination.
+
 

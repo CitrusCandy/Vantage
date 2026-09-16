@@ -116,6 +116,73 @@ class AlertManager:
         self.active_alerts: Dict[str, AlertInstance] = {}
         self.resolved_history: deque = deque(maxlen=self.config.max_resolved_history)
         self.last_evaluation_time: Optional[str] = None
+        self._loaded_from_db: bool = False
+
+    def _ensure_loaded_from_db(self, db: Optional[Session] = None):
+        """Restore active alerts and resolved history from database upon process restart."""
+        if self._loaded_from_db:
+            return
+
+        try:
+            from app.database.database import SessionLocal
+            from app.database.models import OperationalAlert
+
+            close_session = False
+            session = db
+            if session is None:
+                session = SessionLocal()
+                close_session = True
+
+            try:
+                # 1. Restore active alerts
+                active_db = session.query(OperationalAlert).filter(OperationalAlert.status == "active").all()
+                for item in active_db:
+                    sev = AlertSeverity(item.severity) if item.severity in ("info", "warning", "critical") else AlertSeverity.WARNING
+                    instance = AlertInstance(
+                        id=item.alert_id,
+                        rule_name=item.alert_type,
+                        severity=sev,
+                        component=item.component,
+                        message=item.message,
+                        status="active",
+                        first_seen=item.first_seen.isoformat() if item.first_seen else datetime.utcnow().isoformat(),
+                        last_seen=item.last_seen.isoformat() if item.last_seen else datetime.utcnow().isoformat(),
+                        occurrence_count=item.occurrence_count,
+                        metadata=item.metadata_json or {},
+                    )
+                    self.active_alerts[item.alert_id] = instance
+
+                # 2. Restore recent resolved alerts
+                resolved_db = (
+                    session.query(OperationalAlert)
+                    .filter(OperationalAlert.status == "resolved")
+                    .order_by(OperationalAlert.resolved_at.desc())
+                    .limit(self.config.max_resolved_history)
+                    .all()
+                )
+                for item in reversed(resolved_db):
+                    sev = AlertSeverity(item.severity) if item.severity in ("info", "warning", "critical") else AlertSeverity.WARNING
+                    instance = AlertInstance(
+                        id=item.alert_id,
+                        rule_name=item.alert_type,
+                        severity=sev,
+                        component=item.component,
+                        message=item.message,
+                        status="resolved",
+                        first_seen=item.first_seen.isoformat() if item.first_seen else datetime.utcnow().isoformat(),
+                        last_seen=item.last_seen.isoformat() if item.last_seen else datetime.utcnow().isoformat(),
+                        resolved_at=item.resolved_at.isoformat() if item.resolved_at else None,
+                        occurrence_count=item.occurrence_count,
+                        metadata=item.metadata_json or {},
+                    )
+                    self.resolved_history.appendleft(instance)
+
+                self._loaded_from_db = True
+            finally:
+                if close_session:
+                    session.close()
+        except Exception as e:
+            logger.warning("Could not restore alerts from database: %s", e)
 
     def _sanitize_metadata(self, meta: Dict[str, Any]) -> Dict[str, Any]:
         """Ensure no secret tokens, passwords, cookies, or credentials leak into alert metadata."""
@@ -157,6 +224,9 @@ class AlertManager:
                 "active_alerts": [],
                 "resolved_alerts": [],
             }
+
+        # Ensure active alerts from previous server runs are restored
+        self._ensure_loaded_from_db(db)
 
         now_dt = datetime.utcnow()
         now_iso = now_dt.isoformat()
@@ -292,7 +362,7 @@ class AlertManager:
                     firing_keys=current_firing_keys,
                 )
 
-            # B. Specific Repeated LLM / X Failures
+            # C. Specific Repeated LLM / X Failures
             if src_name == "openai" and failures >= self.config.llm_failure_threshold:
                 self._record_firing_alert(
                     rule_name="llm_repeated_failures",
@@ -356,6 +426,7 @@ class AlertManager:
         # -------------------------------------------------------------
         # 5. Resolve Any Alerts That Are No Longer Firing
         # -------------------------------------------------------------
+        resolved_alerts_to_persist = []
         with self._lock:
             all_active_keys = list(self.active_alerts.keys())
             for key in all_active_keys:
@@ -365,10 +436,35 @@ class AlertManager:
                     alert.resolved_at = now_iso
                     self.resolved_history.appendleft(alert)
                     self._log_structured_alert("resolved", alert)
+                    resolved_alerts_to_persist.append(alert)
 
             self.last_evaluation_time = now_iso
             active_list = [a.to_dict() for a in self.active_alerts.values()]
             resolved_list = [a.to_dict() for a in list(self.resolved_history)]
+
+        # Persist resolved status to DB
+        if resolved_alerts_to_persist:
+            try:
+                from app.database.database import SessionLocal
+                from app.database.models import OperationalAlert
+
+                db_sess = db if db is not None else SessionLocal()
+                should_close = db is None
+                try:
+                    for r_alert in resolved_alerts_to_persist:
+                        db_row = db_sess.query(OperationalAlert).filter(OperationalAlert.alert_id == r_alert.id).first()
+                        if db_row:
+                            db_row.status = "resolved"
+                            db_row.resolved_at = now_dt
+                    db_sess.commit()
+                except Exception as db_err:
+                    db_sess.rollback()
+                    logger.warning("Failed to persist resolved alerts to DB: %s", db_err)
+                finally:
+                    if should_close:
+                        db_sess.close()
+            except Exception as e:
+                logger.warning("Resolved alerts DB sync skipped: %s", e)
 
         return {
             "status": "evaluated",
@@ -387,13 +483,16 @@ class AlertManager:
         message: str,
         metadata: Dict[str, Any],
         firing_keys: set,
+        db: Optional[Session] = None,
     ):
-        """Thread-safe deduplication and cooldown registration for active alerts."""
+        """Thread-safe deduplication, cooldown registration, and database persistence for active alerts."""
         alert_id = f"{rule_name}:{component}"
         firing_keys.add(alert_id)
-        now_iso = datetime.utcnow().isoformat()
+        now_dt = datetime.utcnow()
+        now_iso = now_dt.isoformat()
         sanitized_msg = mask_sensitive_data(message)
         sanitized_meta = self._sanitize_metadata(metadata)
+        target_instance = None
 
         with self._lock:
             if alert_id in self.active_alerts:
@@ -403,6 +502,7 @@ class AlertManager:
                 existing.message = sanitized_msg
                 existing.metadata.update(sanitized_meta)
                 existing.severity = severity
+                target_instance = existing
             else:
                 new_alert = AlertInstance(
                     id=alert_id,
@@ -418,9 +518,55 @@ class AlertManager:
                 )
                 self.active_alerts[alert_id] = new_alert
                 self._log_structured_alert("fired", new_alert)
+                target_instance = new_alert
 
-    def get_alerts_summary(self) -> Dict[str, Any]:
+        # Persist active alert to database
+        if target_instance:
+            try:
+                from app.database.database import SessionLocal
+                from app.database.models import OperationalAlert
+
+                db_sess = db if db is not None else SessionLocal()
+                should_close = db is None
+                try:
+                    db_row = db_sess.query(OperationalAlert).filter(OperationalAlert.alert_id == alert_id).first()
+                    sev_str = severity.value if isinstance(severity, AlertSeverity) else str(severity)
+                    if db_row:
+                        db_row.occurrence_count = target_instance.occurrence_count
+                        db_row.last_seen = now_dt
+                        db_row.message = sanitized_msg
+                        db_row.metadata_json = sanitized_meta
+                        db_row.severity = sev_str
+                        db_row.status = "active"
+                        db_row.resolved_at = None
+                    else:
+                        db_row = OperationalAlert(
+                            alert_id=alert_id,
+                            alert_type=rule_name,
+                            severity=sev_str,
+                            component=component,
+                            status="active",
+                            message=sanitized_msg,
+                            occurrence_count=target_instance.occurrence_count,
+                            first_seen=now_dt,
+                            last_seen=now_dt,
+                            metadata_json=sanitized_meta,
+                        )
+                        db_sess.add(db_row)
+                    db_sess.commit()
+                except Exception as db_err:
+                    db_sess.rollback()
+                    logger.warning("Failed to persist active alert to DB: %s", db_err)
+                finally:
+                    if should_close:
+                        db_sess.close()
+            except Exception as e:
+                logger.warning("Active alert DB sync skipped: %s", e)
+
+    def get_alerts_summary(self, db: Optional[Session] = None) -> Dict[str, Any]:
         """Return active alerts and recent resolved history without leaking credentials."""
+        self._ensure_loaded_from_db(db)
+
         with self._lock:
             active_list = [a.to_dict() for a in self.active_alerts.values()]
             resolved_list = [a.to_dict() for a in list(self.resolved_history)]
@@ -440,7 +586,9 @@ class AlertManager:
             self.active_alerts.clear()
             self.resolved_history.clear()
             self.last_evaluation_time = None
+            self._loaded_from_db = True
 
 
 # Global singleton instance for alerting
 alert_manager = AlertManager()
+

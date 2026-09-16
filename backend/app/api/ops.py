@@ -180,38 +180,60 @@ def get_alerts(
     """Return active and recent resolved alerts without exposing credentials."""
     if auto_evaluate:
         return alert_manager.evaluate(db=db)
-    return alert_manager.get_alerts_summary()
+    return alert_manager.get_alerts_summary(db=db)
 
 
 @router.get(
     "/pipeline-metrics",
     summary="Get detailed multi-stage pipeline latency and reliability metrics",
 )
-def get_pipeline_metrics() -> Dict[str, Any]:
+def get_pipeline_metrics(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """Return aggregated telemetry across all pipeline stages, average timings, and slowest stages."""
-    return ops_metrics.get_pipeline_metrics()
+    return ops_metrics.get_pipeline_metrics(db=db)
 
 
 @router.get(
     "/source-health",
     summary="Get operational health and reliability of ingestion sources and LLM providers",
 )
-def get_source_health() -> Dict[str, Any]:
+def get_source_health(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """Return health metrics for Google News, Reddit, X, and OpenAI without exposing credentials."""
-    return ops_metrics.get_source_health_summary()
+    return ops_metrics.get_source_health_summary(db=db)
 
 
 @router.get(
     "/worker-metrics",
     summary="Get background worker execution cycles and scheduler metrics",
 )
-def get_worker_metrics() -> Dict[str, Any]:
+def get_worker_metrics(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """Return scheduler state, cycles executed, and last refresh breakdown."""
+    from app.database.models import WorkerCycle
+
     status_data = scheduler.get_status()
     last_res = status_data.get("last_run_result") or {}
+
+    total_cycles = status_data["total_runs"]
+    if total_cycles == 0 and db is not None:
+        try:
+            db_cycle_count = db.query(WorkerCycle).count()
+            if db_cycle_count > 0:
+                total_cycles = db_cycle_count
+                latest_cycle = db.query(WorkerCycle).order_by(WorkerCycle.started_at.desc()).first()
+                if latest_cycle and not status_data["last_run_time"]:
+                    status_data["last_run_time"] = latest_cycle.started_at.isoformat()
+                    last_res = {
+                        "topics_considered": latest_cycle.topics_considered,
+                        "topics_refreshed": latest_cycle.topics_refreshed,
+                        "topics_skipped": latest_cycle.topics_skipped,
+                        "topics_failed": latest_cycle.topics_failed,
+                        "candidates_discovered": 0,
+                    }
+        except Exception as e:
+            logger.warning("Error fetching persisted worker cycles: %s", e)
+
     return {
         "scheduler_running": status_data["is_running"],
-        "cycle_count": status_data["total_runs"],
+        "cycle_count": total_cycles,
         "interval_hours": status_data["worker_interval_hours"],
         "last_cycle_time": status_data["last_run_time"],
         "next_scheduled_cycle": status_data["next_scheduled_run"],
@@ -223,6 +245,221 @@ def get_worker_metrics() -> Dict[str, Any]:
             "topics_failed": last_res.get("topics_failed", 0),
             "candidates_discovered": last_res.get("candidates_discovered", 0),
         },
+    }
+
+
+@router.get(
+    "/history",
+    summary="Query historical operational audit logs with filtering and pagination",
+)
+def get_ops_history(
+    type: str = Query(
+        default="all",
+        description="Filter record type: all, pipeline_runs, source_executions, worker_cycles, alerts",
+    ),
+    component: Optional[str] = Query(
+        default=None,
+        description="Filter by component name or source identifier (e.g. google_news, reddit, worker, pipeline)",
+    ),
+    status: Optional[str] = Query(
+        default=None,
+        description="Filter by execution/alert status (e.g. success, failed, timeout, active, resolved)",
+    ),
+    topic_slug: Optional[str] = Query(
+        default=None,
+        description="Filter by topic slug (applicable to pipeline runs)",
+    ),
+    start_time: Optional[str] = Query(
+        default=None,
+        description="ISO datetime lower bound filter",
+    ),
+    end_time: Optional[str] = Query(
+        default=None,
+        description="ISO datetime upper bound filter",
+    ),
+    page: int = Query(default=1, ge=1, description="1-based page number"),
+    limit: int = Query(default=50, ge=1, le=100, description="Items per page (max 100)"),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Retrieve persisted operational history with structured audit metadata, strict transaction safety, and no raw data leakage."""
+    from app.database.models import OperationalAlert, PipelineRun, SourceExecution, WorkerCycle
+
+    start_dt = None
+    end_dt = None
+    if start_time:
+        try:
+            start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid start_time format. Expected ISO 8601 string.",
+            )
+    if end_time:
+        try:
+            end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid end_time format. Expected ISO 8601 string.",
+            )
+
+    items: List[Dict[str, Any]] = []
+    total_count = 0
+
+    valid_types = {"all", "pipeline_runs", "source_executions", "worker_cycles", "alerts"}
+    if type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid type '{type}'. Expected one of: {', '.join(sorted(valid_types))}",
+        )
+
+    # Helper filters
+    def apply_time_filter(query, col):
+        if start_dt:
+            query = query.filter(col >= start_dt)
+        if end_dt:
+            query = query.filter(col <= end_dt)
+        return query
+
+    offset = (page - 1) * limit
+
+    if type == "pipeline_runs":
+        q = db.query(PipelineRun)
+        if status:
+            q = q.filter(PipelineRun.status == status)
+        if topic_slug:
+            q = q.filter(PipelineRun.topic_slug == topic_slug)
+        if component:
+            q = q.filter(PipelineRun.pipeline_type.ilike(f"%{component}%"))
+        q = apply_time_filter(q, PipelineRun.started_at)
+        total_count = q.count()
+        rows = q.order_by(PipelineRun.started_at.desc()).offset(offset).limit(limit).all()
+        for r in rows:
+            d = r.to_dict()
+            d["record_type"] = "pipeline_run"
+            items.append(d)
+
+    elif type == "source_executions":
+        q = db.query(SourceExecution)
+        if status:
+            q = q.filter(SourceExecution.status == status)
+        if component:
+            q = q.filter(SourceExecution.source == component)
+        q = apply_time_filter(q, SourceExecution.started_at)
+        total_count = q.count()
+        rows = q.order_by(SourceExecution.started_at.desc()).offset(offset).limit(limit).all()
+        for r in rows:
+            d = r.to_dict()
+            d["record_type"] = "source_execution"
+            items.append(d)
+
+    elif type == "worker_cycles":
+        q = db.query(WorkerCycle)
+        if status:
+            q = q.filter(WorkerCycle.status == status)
+        q = apply_time_filter(q, WorkerCycle.started_at)
+        total_count = q.count()
+        rows = q.order_by(WorkerCycle.started_at.desc()).offset(offset).limit(limit).all()
+        for r in rows:
+            d = r.to_dict()
+            d["record_type"] = "worker_cycle"
+            items.append(d)
+
+    elif type == "alerts":
+        q = db.query(OperationalAlert)
+        if status:
+            q = q.filter(OperationalAlert.status == status)
+        if component:
+            q = q.filter(
+                (OperationalAlert.component.ilike(f"%{component}%"))
+                | (OperationalAlert.alert_type.ilike(f"%{component}%"))
+            )
+        q = apply_time_filter(q, OperationalAlert.last_seen)
+        total_count = q.count()
+        rows = q.order_by(OperationalAlert.last_seen.desc()).offset(offset).limit(limit).all()
+        for r in rows:
+            d = r.to_dict()
+            d["record_type"] = "alert"
+            items.append(d)
+
+    else:
+        # type == "all": aggregate across all operational tables
+        p_q = apply_time_filter(db.query(PipelineRun), PipelineRun.started_at)
+        if status:
+            p_q = p_q.filter(PipelineRun.status == status)
+        if topic_slug:
+            p_q = p_q.filter(PipelineRun.topic_slug == topic_slug)
+        if component:
+            p_q = p_q.filter(PipelineRun.pipeline_type.ilike(f"%{component}%"))
+
+        s_q = apply_time_filter(db.query(SourceExecution), SourceExecution.started_at)
+        if status:
+            s_q = s_q.filter(SourceExecution.status == status)
+        if component:
+            s_q = s_q.filter(SourceExecution.source == component)
+
+        w_q = apply_time_filter(db.query(WorkerCycle), WorkerCycle.started_at)
+        if status:
+            w_q = w_q.filter(WorkerCycle.status == status)
+
+        a_q = apply_time_filter(db.query(OperationalAlert), OperationalAlert.last_seen)
+        if status:
+            a_q = a_q.filter(OperationalAlert.status == status)
+        if component:
+            a_q = a_q.filter(
+                (OperationalAlert.component.ilike(f"%{component}%"))
+                | (OperationalAlert.alert_type.ilike(f"%{component}%"))
+            )
+
+        p_count = p_q.count()
+        s_count = s_q.count()
+        w_count = w_q.count()
+        a_count = a_q.count()
+        total_count = p_count + s_count + w_count + a_count
+
+        # Fetch recent records from each table up to limit and merge
+        fetch_limit = min(offset + limit, 500)
+        p_rows = [
+            dict(r.to_dict(), record_type="pipeline_run", timestamp=r.started_at)
+            for r in p_q.order_by(PipelineRun.started_at.desc()).limit(fetch_limit).all()
+        ]
+        s_rows = [
+            dict(r.to_dict(), record_type="source_execution", timestamp=r.started_at)
+            for r in s_q.order_by(SourceExecution.started_at.desc()).limit(fetch_limit).all()
+        ]
+        w_rows = [
+            dict(r.to_dict(), record_type="worker_cycle", timestamp=r.started_at)
+            for r in w_q.order_by(WorkerCycle.started_at.desc()).limit(fetch_limit).all()
+        ]
+        a_rows = [
+            dict(r.to_dict(), record_type="alert", timestamp=r.last_seen)
+            for r in a_q.order_by(OperationalAlert.last_seen.desc()).limit(fetch_limit).all()
+        ]
+
+        all_records = p_rows + s_rows + w_rows + a_rows
+        # Sort descending by timestamp
+        all_records.sort(
+            key=lambda x: x.get("timestamp") or datetime.min,
+            reverse=True,
+        )
+
+        for rec in all_records[offset : offset + limit]:
+            if "timestamp" in rec and isinstance(rec["timestamp"], datetime):
+                rec["timestamp"] = rec["timestamp"].isoformat()
+            items.append(rec)
+
+    total_pages = (total_count + limit - 1) // limit if total_count > 0 else 1
+
+    return {
+        "status": "success",
+        "type": type,
+        "page": page,
+        "limit": limit,
+        "total_count": total_count,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_prev": page > 1,
+        "items": items,
     }
 
 

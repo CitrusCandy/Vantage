@@ -2,12 +2,16 @@ from app.database.database import Base, SessionLocal, engine, get_db
 from app.database.models import (
     ClusterRun,
     CombinedRawData,
+    OperationalAlert,
     Perspective,
+    PipelineRun,
     RawData,
     RawGoogleNews,
     RawReddit,
     RawX,
+    SourceExecution,
     Topic,
+    WorkerCycle,
 )
 
 __all__ = [
@@ -23,4 +27,9 @@ __all__ = [
     "RawData",
     "Perspective",
     "ClusterRun",
+    "PipelineRun",
+    "SourceExecution",
+    "WorkerCycle",
+    "OperationalAlert",
 ]
+

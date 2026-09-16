@@ -61,24 +61,92 @@ class BackgroundScheduler:
         auto_discover: bool = False,
         force_refresh_all: bool = False,
     ) -> Dict[str, Any]:
-        """Trigger an immediate execution cycle in the calling thread."""
+        """Trigger an immediate execution cycle in the calling thread and persist history."""
         logger.info("Triggering immediate topic refresh job")
+        t_start = time.perf_counter()
+        start_dt = datetime.utcnow()
         try:
             result = run_trending_refresh_job(
                 auto_discover=auto_discover,
                 force_refresh_all=force_refresh_all,
             )
+            duration_ms = (time.perf_counter() - t_start) * 1000.0
+            completed_dt = datetime.utcnow()
+
             with self._lock:
-                self.last_run_time = datetime.utcnow()
+                self.last_run_time = completed_dt
                 self.last_run_result = result
                 self.last_error = None
                 self.total_runs += 1
+
+            self._persist_cycle(
+                started_at=start_dt,
+                completed_at=completed_dt,
+                duration_ms=duration_ms,
+                topics_considered=result.get("total_topics_evaluated", 0),
+                topics_refreshed=result.get("refreshed_topics", 0),
+                topics_skipped=result.get("skipped_stagnant_topics", 0),
+                topics_failed=len(result.get("errors", [])),
+                status="success",
+            )
             return result
         except Exception as e:
-            logger.error("Error during manual trigger: %s", str(e))
+            duration_ms = (time.perf_counter() - t_start) * 1000.0
+            completed_dt = datetime.utcnow()
+            err_msg = str(e)
+            logger.error("Error during manual trigger: %s", err_msg)
             with self._lock:
-                self.last_error = str(e)
+                self.last_error = err_msg
+
+            self._persist_cycle(
+                started_at=start_dt,
+                completed_at=completed_dt,
+                duration_ms=duration_ms,
+                status="failed",
+                error_summary=err_msg[:255],
+            )
             raise
+
+    def _persist_cycle(
+        self,
+        started_at: datetime,
+        completed_at: datetime,
+        duration_ms: float,
+        topics_considered: int = 0,
+        topics_refreshed: int = 0,
+        topics_skipped: int = 0,
+        topics_failed: int = 0,
+        status: str = "success",
+        error_summary: Optional[str] = None,
+    ):
+        """Persist worker cycle execution to the database safely."""
+        try:
+            from app.core.security import mask_sensitive_data
+            from app.database.database import SessionLocal
+            from app.database.models import WorkerCycle
+
+            db = SessionLocal()
+            try:
+                cycle = WorkerCycle(
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    duration_ms=duration_ms,
+                    topics_considered=topics_considered,
+                    topics_refreshed=topics_refreshed,
+                    topics_skipped=topics_skipped,
+                    topics_failed=topics_failed,
+                    status=status,
+                    error_summary=mask_sensitive_data(error_summary) if error_summary else None,
+                )
+                db.add(cycle)
+                db.commit()
+            except Exception as db_err:
+                db.rollback()
+                logger.warning("Failed to persist WorkerCycle to database: %s", db_err)
+            finally:
+                db.close()
+        except Exception as outer_err:
+            logger.warning("WorkerCycle persistence skipped: %s", outer_err)
 
     def _run_loop(self, auto_discover: bool, run_immediately: bool) -> None:
         """Main loop executed by the background thread."""

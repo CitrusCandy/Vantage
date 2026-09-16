@@ -11,7 +11,10 @@ from app.database.database import Base, engine
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Ensure database schema is initialized on startup
-    Base.metadata.create_all(bind=engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        logging.getLogger("app.main").warning("Database startup init skipped: %s", e)
     yield
 
 

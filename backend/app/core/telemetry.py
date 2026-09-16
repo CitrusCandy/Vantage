@@ -1,12 +1,14 @@
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import statistics
 import threading
 import time
 from typing import Any, Dict, List, Optional
+
+from app.core.security import mask_sensitive_data
 
 logger = logging.getLogger("app.core.telemetry")
 
@@ -168,7 +170,16 @@ class OpsMetricsRegistry:
         status: str = "success",
         error: Optional[str] = None,
         timestamp: Optional[datetime] = None,
+        sample_size: int = 0,
+        cluster_count: int = 0,
+        perspective_count: int = 0,
+        failure_stage: Optional[str] = None,
+        error_type: Optional[str] = None,
     ):
+        ts = timestamp or datetime.utcnow()
+        sanitized_error = mask_sensitive_data(error) if error else None
+        sanitized_err_type = mask_sensitive_data(error_type) if error_type else None
+
         with self._lock:
             self.recent_runs.appendleft({
                 "id": len(self.recent_runs) + 1,
@@ -177,9 +188,51 @@ class OpsMetricsRegistry:
                 "total_duration_ms": round(total_duration_ms, 2),
                 "stages_ms": stages_ms,
                 "status": status,
-                "error": error,
-                "timestamp": (timestamp or datetime.utcnow()).isoformat(),
+                "error": sanitized_error,
+                "sample_size": sample_size,
+                "cluster_count": cluster_count,
+                "perspective_count": perspective_count,
+                "failure_stage": failure_stage,
+                "timestamp": ts.isoformat(),
             })
+
+        # Graceful database persistence
+        try:
+            from app.database.database import SessionLocal
+            from app.database.models import PipelineRun, Topic
+
+            db = SessionLocal()
+            try:
+                topic_id = None
+                if topic_slug:
+                    t = db.query(Topic).filter(Topic.slug == topic_slug).first()
+                    if t:
+                        topic_id = t.id
+
+                p_run = PipelineRun(
+                    topic_id=topic_id,
+                    topic_slug=topic_slug,
+                    pipeline_type=pipeline_name,
+                    status=status,
+                    started_at=ts,
+                    completed_at=datetime.utcnow(),
+                    duration_ms=total_duration_ms,
+                    sample_size=sample_size,
+                    cluster_count=cluster_count,
+                    perspective_count=perspective_count,
+                    failure_stage=failure_stage,
+                    error_type=sanitized_err_type or sanitized_error,
+                    stages_ms=stages_ms,
+                )
+                db.add(p_run)
+                db.commit()
+            except Exception as db_err:
+                db.rollback()
+                logger.warning("Failed to persist PipelineRun to database: %s", db_err)
+            finally:
+                db.close()
+        except Exception as outer_err:
+            logger.warning("PipelineRun persistence skipped: %s", outer_err)
 
     def record_source_execution(
         self,
@@ -188,18 +241,24 @@ class OpsMetricsRegistry:
         latency_ms: float,
         is_timeout: bool = False,
         error_summary: Optional[str] = None,
+        operation: str = "fetch",
+        item_count: int = 0,
     ):
+        now_dt = datetime.utcnow()
+        now_str = now_dt.isoformat()
+        sanitized_err = mask_sensitive_data(error_summary) if error_summary else None
+        status_val = "timeout" if is_timeout else ("success" if success else "failed")
+
         with self._lock:
             if source_name not in self.source_health:
                 self.source_health[source_name] = SourceHealthStatus(source_name=source_name, enabled=True)
 
             src = self.source_health[source_name]
-            now_str = datetime.utcnow().isoformat()
 
             if is_timeout:
                 src.timeout_count += 1
                 src.last_failure = now_str
-                src.last_error_summary = error_summary or "Request timed out"
+                src.last_error_summary = sanitized_err or "Request timed out"
             elif success:
                 src.success_count += 1
                 src.total_latency_ms += latency_ms
@@ -207,17 +266,96 @@ class OpsMetricsRegistry:
             else:
                 src.failure_count += 1
                 src.last_failure = now_str
-                src.last_error_summary = error_summary or "Execution failed"
+                src.last_error_summary = sanitized_err or "Execution failed"
 
-    def get_source_health_summary(self) -> Dict[str, Any]:
+        # Graceful database persistence
+        try:
+            from app.database.database import SessionLocal
+            from app.database.models import SourceExecution
+
+            db = SessionLocal()
+            try:
+                src_exec = SourceExecution(
+                    source=source_name,
+                    operation=operation,
+                    status=status_val,
+                    started_at=now_dt - timedelta(milliseconds=latency_ms),
+                    completed_at=now_dt,
+                    duration_ms=latency_ms,
+                    item_count=item_count,
+                    error_type=sanitized_err,
+                )
+                db.add(src_exec)
+                db.commit()
+            except Exception as db_err:
+                db.rollback()
+                logger.warning("Failed to persist SourceExecution to database: %s", db_err)
+            finally:
+                db.close()
+        except Exception as outer_err:
+            logger.warning("SourceExecution persistence skipped: %s", outer_err)
+
+    def get_source_health_summary(self, db=None) -> Dict[str, Any]:
         with self._lock:
-            return {
+            result = {
                 name: item.to_dict() for name, item in self.source_health.items()
             }
 
-    def get_pipeline_metrics(self) -> Dict[str, Any]:
+        # If in-memory counters are zero and db session is provided, populate from persisted executions
+        if db is not None:
+            try:
+                from app.database.models import SourceExecution
+                for src_name in list(result.keys()):
+                    if result[src_name]["total_requests"] == 0:
+                        total_db = db.query(SourceExecution).filter(SourceExecution.source == src_name).count()
+                        if total_db > 0:
+                            succ_db = db.query(SourceExecution).filter(
+                                SourceExecution.source == src_name,
+                                SourceExecution.status == "success",
+                            ).count()
+                            fail_db = db.query(SourceExecution).filter(
+                                SourceExecution.source == src_name,
+                                SourceExecution.status != "success",
+                            ).count()
+                            last_succ = db.query(SourceExecution).filter(
+                                SourceExecution.source == src_name,
+                                SourceExecution.status == "success",
+                            ).order_by(SourceExecution.started_at.desc()).first()
+
+                            result[src_name]["total_requests"] = total_db
+                            result[src_name]["success_count"] = succ_db
+                            result[src_name]["failure_count"] = fail_db
+                            if last_succ and last_succ.started_at:
+                                result[src_name]["last_success"] = last_succ.started_at.isoformat()
+                            result[src_name]["status"] = (
+                                "healthy" if fail_db == 0 else ("degraded" if succ_db > fail_db else "unavailable")
+                            )
+            except Exception as e:
+                logger.warning("Error reading persisted source execution stats: %s", e)
+
+        return result
+
+    def get_pipeline_metrics(self, db=None) -> Dict[str, Any]:
         with self._lock:
             runs = list(self.recent_runs)
+
+        if len(runs) == 0 and db is not None:
+            try:
+                from app.database.models import PipelineRun
+                db_runs = (
+                    db.query(PipelineRun)
+                    .order_by(PipelineRun.started_at.desc())
+                    .limit(20)
+                    .all()
+                )
+                runs = [r.to_dict() for r in db_runs]
+                # Format to match run dict schema
+                for r in runs:
+                    r["total_duration_ms"] = r.get("duration_ms", 0.0)
+                    r["pipeline_name"] = r.get("pipeline_type", "discourse_pipeline")
+                    r["timestamp"] = r.get("started_at")
+            except Exception as e:
+                logger.warning("Error reading persisted pipeline runs: %s", e)
 
         total_runs = len(runs)
         if total_runs == 0:

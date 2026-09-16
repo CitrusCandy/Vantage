@@ -199,3 +199,59 @@ export interface OpsWorkerMetrics {
     candidates_discovered: number;
   };
 }
+
+export interface OpsHistoryItem {
+  record_type: "pipeline_run" | "source_execution" | "worker_cycle" | "alert";
+  timestamp?: string | null;
+  status?: string;
+  duration_ms?: number;
+  // Pipeline Run specific
+  run_id?: number;
+  topic_id?: number | null;
+  topic_slug?: string | null;
+  pipeline_type?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  sample_size?: number;
+  cluster_count?: number;
+  perspective_count?: number;
+  failure_stage?: string | null;
+  error_type?: string | null;
+  stages_ms?: Record<string, number>;
+  // Source Execution specific
+  execution_id?: number;
+  source?: string;
+  operation?: string;
+  item_count?: number;
+  // Worker Cycle specific
+  cycle_id?: number;
+  topics_considered?: number;
+  topics_refreshed?: number;
+  topics_skipped?: number;
+  topics_failed?: number;
+  error_summary?: string | null;
+  // Alert specific
+  id?: string;
+  rule_name?: string;
+  severity?: "info" | "warning" | "critical";
+  component?: string;
+  message?: string;
+  occurrence_count?: number;
+  first_seen?: string | null;
+  last_seen?: string | null;
+  resolved_at?: string | null;
+  metadata?: Record<string, any>;
+}
+
+export interface OpsHistoryResponse {
+  status: string;
+  type: string;
+  page: number;
+  limit: number;
+  total_count: number;
+  total_pages: number;
+  has_next: boolean;
+  has_prev: boolean;
+  items: OpsHistoryItem[];
+}
+

@@ -44,6 +44,15 @@ Every HTTP response from FastAPI backend enforces modern security headers:
 
 ---
 
-## 5. Automated CI Secret Scanning
+## 5. Operational History & Audit Data Protection
+
+- **Metadata-Only Persistence**: Operational tables (`pipeline_runs`, `source_executions`, `worker_cycles`, `operational_alerts`) only store operational execution metadata (timings, counts, statuses, sanitized error types).
+- **Zero Content Leakage**: Raw scraped article text, social media post bodies, prompts, LLM completion payloads, cookies, session keys, and database passwords are never stored in operational history tables.
+- **Transaction Safety & Error Isolation**: Operational telemetry and alert writes use isolated try/except/rollback blocks. A database error writing operational telemetry will never disrupt the primary user pipeline or cause worker crashes.
+
+---
+
+## 6. Automated CI Secret Scanning
 
 The CI quality gate and local `scripts/verify_release.py` automatically scan all tracked files for accidental `.env` files, unmasked private keys (`.pem`, `.key`), or OpenAI / GitHub credential patterns before commit or deployment.
+

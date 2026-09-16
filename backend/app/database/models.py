@@ -137,3 +137,152 @@ class ClusterRun(Base):
     run_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     topic = relationship("Topic", back_populates="cluster_runs")
+
+
+# ==========================================
+# Persistent Operational History & Telemetry
+# ==========================================
+
+
+class PipelineRun(Base):
+    __tablename__ = "pipeline_runs"
+
+    run_id = Column(Integer, primary_key=True, index=True)
+    topic_id = Column(Integer, ForeignKey("topics.id"), nullable=True, index=True)
+    topic_slug = Column(String(255), nullable=True, index=True)
+    pipeline_type = Column(String(100), nullable=False, default="discourse_pipeline")
+    status = Column(String(50), nullable=False, default="success")  # success, failed, running
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    duration_ms = Column(Float, nullable=False, default=0.0)
+    sample_size = Column(Integer, default=0, nullable=True)
+    cluster_count = Column(Integer, default=0, nullable=True)
+    perspective_count = Column(Integer, default=0, nullable=True)
+    failure_stage = Column(String(100), nullable=True)
+    error_type = Column(String(255), nullable=True)
+    stages_ms = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_pipeline_runs_status_started", "status", "started_at"),
+        Index("ix_pipeline_runs_slug_started", "topic_slug", "started_at"),
+    )
+
+    def to_dict(self):
+        return {
+            "run_id": self.run_id,
+            "topic_id": self.topic_id,
+            "topic_slug": self.topic_slug,
+            "pipeline_type": self.pipeline_type,
+            "status": self.status,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "duration_ms": round(self.duration_ms, 2),
+            "sample_size": self.sample_size,
+            "cluster_count": self.cluster_count,
+            "perspective_count": self.perspective_count,
+            "failure_stage": self.failure_stage,
+            "error_type": self.error_type,
+            "stages_ms": self.stages_ms or {},
+        }
+
+
+class SourceExecution(Base):
+    __tablename__ = "source_executions"
+
+    execution_id = Column(Integer, primary_key=True, index=True)
+    source = Column(String(50), nullable=False, index=True)  # google_news, reddit, x, openai
+    operation = Column(String(100), nullable=False, default="fetch")  # fetch, scrape, embeddings, synthesis
+    status = Column(String(50), nullable=False, default="success")  # success, failed, timeout
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    duration_ms = Column(Float, nullable=False, default=0.0)
+    item_count = Column(Integer, default=0, nullable=True)
+    error_type = Column(String(255), nullable=True)
+
+    __table_args__ = (
+        Index("ix_source_executions_src_status_started", "source", "status", "started_at"),
+    )
+
+    def to_dict(self):
+        return {
+            "execution_id": self.execution_id,
+            "source": self.source,
+            "operation": self.operation,
+            "status": self.status,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "duration_ms": round(self.duration_ms, 2),
+            "item_count": self.item_count,
+            "error_type": self.error_type,
+        }
+
+
+class WorkerCycle(Base):
+    __tablename__ = "worker_cycles"
+
+    cycle_id = Column(Integer, primary_key=True, index=True)
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    duration_ms = Column(Float, nullable=False, default=0.0)
+    topics_considered = Column(Integer, default=0, nullable=False)
+    topics_refreshed = Column(Integer, default=0, nullable=False)
+    topics_skipped = Column(Integer, default=0, nullable=False)
+    topics_failed = Column(Integer, default=0, nullable=False)
+    status = Column(String(50), nullable=False, default="success")  # success, failed
+    error_summary = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_worker_cycles_status_started", "status", "started_at"),
+    )
+
+    def to_dict(self):
+        return {
+            "cycle_id": self.cycle_id,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "duration_ms": round(self.duration_ms, 2),
+            "topics_considered": self.topics_considered,
+            "topics_refreshed": self.topics_refreshed,
+            "topics_skipped": self.topics_skipped,
+            "topics_failed": self.topics_failed,
+            "status": self.status,
+            "error_summary": self.error_summary,
+        }
+
+
+class OperationalAlert(Base):
+    __tablename__ = "operational_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alert_id = Column(String(150), unique=True, index=True, nullable=False)  # rule_name:component
+    alert_type = Column(String(100), nullable=False, index=True)  # rule_name
+    severity = Column(String(50), nullable=False, index=True)  # info, warning, critical
+    component = Column(String(100), nullable=False, index=True)
+    status = Column(String(50), nullable=False, default="active", index=True)  # active, resolved
+    message = Column(Text, nullable=False)
+    occurrence_count = Column(Integer, default=1, nullable=False)
+    first_seen = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_seen = Column(DateTime, default=datetime.utcnow, nullable=False)
+    resolved_at = Column(DateTime, nullable=True)
+    metadata_json = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_operational_alerts_status_severity", "status", "severity"),
+        Index("ix_operational_alerts_last_seen", "last_seen"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.alert_id,
+            "rule_name": self.alert_type,
+            "severity": self.severity,
+            "component": self.component,
+            "status": self.status,
+            "message": self.message,
+            "occurrence_count": self.occurrence_count,
+            "first_seen": self.first_seen.isoformat() if self.first_seen else None,
+            "last_seen": self.last_seen.isoformat() if self.last_seen else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "metadata": self.metadata_json or {},
+        }
+

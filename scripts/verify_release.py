@@ -46,6 +46,7 @@ def verify_project_files(root: Path) -> bool:
         "backend/app/main.py",
         "backend/app/database/database.py",
         "backend/app/database/models.py",
+        "backend/app/database/cleanup_ops_history.py",
         "backend/app/core/security.py",
         "backend/app/core/telemetry.py",
         "backend/app/core/alerting.py",
