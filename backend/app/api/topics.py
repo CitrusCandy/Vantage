@@ -17,6 +17,7 @@ from app.database.schemas import (
 )
 from app.ingestion.merge_pipeline import MergePipeline
 from app.ingestion.pipeline import IngestionPipeline
+from app.llm.pipeline import PerspectivePipeline
 from app.processing.cluster_pipeline import ClusterPipeline
 
 router = APIRouter(prefix="/topics", tags=["Topics"])
@@ -242,6 +243,36 @@ def cluster_topic(
 
     pipeline = ClusterPipeline()
     return pipeline.run_for_topic(
+        topic=topic,
+        db=db,
+        min_volume_threshold=min_volume_threshold,
+    )
+
+
+@router.post(
+    "/{slug}/synthesize",
+    status_code=status.HTTP_200_OK,
+    summary="Trigger LLM perspective synthesis for a topic",
+)
+def synthesize_topic_perspectives(
+    slug: str,
+    min_volume_threshold: int = Query(
+        default=30,
+        ge=2,
+        description="Minimum usable discourse posts required before synthesis",
+    ),
+    db: Session = Depends(get_db),
+):
+    """Extract representative cluster samples and synthesize structured perspectives using LLM."""
+    topic = db.query(Topic).filter(Topic.slug == slug).first()
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Topic with slug '{slug}' not found",
+        )
+
+    pipeline = PerspectivePipeline()
+    return pipeline.run_synthesis_for_topic(
         topic=topic,
         db=db,
         min_volume_threshold=min_volume_threshold,
