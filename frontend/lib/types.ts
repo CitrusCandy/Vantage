@@ -343,7 +343,18 @@ export interface CostTracking {
   external_requests: Record<string, number>;
 }
 
+export interface GovernanceBackendInfo {
+  backend: "memory" | "redis" | string;
+  configured_backend: string;
+  is_healthy: boolean;
+  fallback_active: boolean;
+  fallback_allowed: boolean;
+  redis_configured: boolean;
+  last_error?: string | null;
+}
+
 export interface ResourceUsageResponse {
+  governance_backend?: GovernanceBackendInfo;
   rate_limits: Record<string, RateLimitInfo>;
   concurrency: Record<string, ConcurrencyInfo>;
   cost_tracking: CostTracking;
@@ -364,6 +375,7 @@ export interface ExternalSourceConfig {
 }
 
 export interface ResourceBudgetsResponse {
+  governance_backend?: GovernanceBackendInfo;
   budgets: Record<string, number>;
   thresholds: {
     warning_threshold: number;

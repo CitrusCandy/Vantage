@@ -12,3 +12,4 @@ praw
 beautifulsoup4
 selenium
 pytest
+redis

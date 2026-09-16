@@ -791,7 +791,10 @@ def get_resource_usage() -> Dict[str, Any]:
             "status": status_val,
         }
 
+    backend_info = resource_governor.coordinator.get_backend_info()
+
     return {
+        "governance_backend": backend_info,
         "rate_limits": rate_limit_usage,
         "concurrency": concurrency_usage,
         "cost_tracking": cost_usage,
@@ -810,6 +813,7 @@ def get_resource_usage() -> Dict[str, Any]:
 def get_resource_budgets() -> Dict[str, Any]:
     """Return all configured resource budget limits without exposing secrets."""
     return {
+        "governance_backend": resource_governor.coordinator.get_backend_info(),
         "budgets": resource_governor.budget_manager.get_all_budgets(),
         "thresholds": resource_governor.utilization_monitor.get_thresholds(),
         "external_source_governance": {

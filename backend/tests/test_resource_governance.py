@@ -5,7 +5,10 @@ No external API calls or network access is required.
 """
 
 import os
+import threading
 import time
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pytest
 from fastapi.testclient import TestClient
@@ -644,4 +647,315 @@ class TestResourceGovernanceEdgeCases:
         resp = test_client.post("/api/ops/backups/create?dry_run=true", headers={"X-Ops-Key": ""})
         assert resp.status_code == 429
         assert "Retry-After" in resp.headers
+
+
+# ==========================================
+# Distributed & Multi-Worker Coordination Tests
+# ==========================================
+
+
+class FakeRedisClient:
+    """Thread-safe in-memory Redis simulator for offline deterministic testing."""
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._strings: Dict[str, Any] = {}
+        self._zsets: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self._sets: Dict[str, Set[str]] = defaultdict(set)
+        self._hashes: Dict[str, Dict[str, int]] = defaultdict(dict)
+        self._expirations: Dict[str, float] = {}
+
+    def _is_expired(self, key: str) -> bool:
+        if key in self._expirations:
+            if time.time() > self._expirations[key]:
+                self._strings.pop(key, None)
+                self._zsets.pop(key, None)
+                self._sets.pop(key, None)
+                self._hashes.pop(key, None)
+                self._expirations.pop(key, None)
+                return True
+        return False
+
+    def ping(self) -> bool:
+        return True
+
+    def register_script(self, script_text: str):
+        # Return a callable that executes via eval
+        def _exec(keys, args):
+            return self.eval(script_text, len(keys), *(list(keys) + list(args)))
+        return _exec
+
+    def eval(self, script: str, numkeys: int, *keys_and_args):
+        with self._lock:
+            keys = list(keys_and_args[:numkeys])
+            args = list(keys_and_args[numkeys:])
+
+            # 1. Sliding window rate limit
+            if "ZREMRANGEBYSCORE" in script:
+                key = keys[0]
+                now = float(args[0])
+                window = float(args[1])
+                limit = int(args[2])
+                member = str(args[3])
+
+                self._is_expired(key)
+                z = self._zsets[key]
+                clear_before = now - window
+                # Remove expired
+                expired_members = [m for m, s in z.items() if s <= clear_before]
+                for m in expired_members:
+                    del z[m]
+
+                current_count = len(z)
+                if current_count < limit:
+                    z[member] = now
+                    self._expirations[key] = time.time() + window + 15
+                    return [1, 0.0, current_count + 1]
+                else:
+                    oldest_score = min(z.values()) if z else now
+                    retry_after = max(0.1, (oldest_score + window) - now)
+                    return [0, retry_after, current_count]
+
+            # 2. Concurrency acquire
+            elif "concurrency" in script or "SISMEMBER" in script:
+                holders_key = keys[0]
+                lease_key = keys[1]
+                holder = str(args[0])
+                limit = int(args[1])
+                ttl = float(args[2])
+
+                self._is_expired(holders_key)
+                # Check for duplicate
+                if holder in self._sets[holders_key]:
+                    return 0
+
+                # Prune expired leases
+                base_key = holders_key.rsplit(':holders', 1)[0]
+                all_holders = list(self._sets[holders_key])
+                for h in all_holders:
+                    lk = f"{base_key}:lease:{h}"
+                    if self._is_expired(lk) or lk not in self._strings:
+                        self._sets[holders_key].discard(h)
+
+                current = len(self._sets[holders_key])
+                if limit > 0 and current >= limit:
+                    return 0
+
+                self._sets[holders_key].add(holder)
+                self._strings[lease_key] = 1
+                self._expirations[lease_key] = time.time() + ttl
+                return 1
+
+            # 3. Concurrency release
+            elif "SREM" in script:
+                holders_key = keys[0]
+                lease_key = keys[1]
+                holder = str(args[0])
+                self._sets[holders_key].discard(holder)
+                self._strings.pop(lease_key, None)
+                self._expirations.pop(lease_key, None)
+                return 1
+
+            return None
+
+    def pipeline(self):
+        client = self
+        class FakePipeline:
+            def __init__(self):
+                self.calls = []
+            def zremrangebyscore(self, key, min_val, max_val):
+                self.calls.append(("zremrangebyscore", key, max_val))
+                return self
+            def zcard(self, key):
+                self.calls.append(("zcard", key))
+                return self
+            def execute(self):
+                res = []
+                with client._lock:
+                    for call, key, *cargs in self.calls:
+                        client._is_expired(key)
+                        if call == "zremrangebyscore":
+                            max_v = float(cargs[0])
+                            z = client._zsets[key]
+                            exp = [m for m, s in z.items() if s <= max_v]
+                            for m in exp:
+                                del z[m]
+                            res.append(len(exp))
+                        elif call == "zcard":
+                            res.append(len(client._zsets[key]))
+                return res
+        return FakePipeline()
+
+    def smembers(self, key: str):
+        with self._lock:
+            self._is_expired(key)
+            return set(self._sets.get(key, set()))
+
+    def srem(self, key: str, member: str):
+        with self._lock:
+            self._sets[key].discard(member)
+
+    def exists(self, key: str) -> bool:
+        with self._lock:
+            if self._is_expired(key):
+                return False
+            return key in self._strings or key in self._sets or key in self._zsets or key in self._hashes
+
+    def hincrby(self, key: str, field: str, amount: int = 1) -> int:
+        with self._lock:
+            self._is_expired(key)
+            current = self._hashes[key].get(field, 0)
+            self._hashes[key][field] = current + amount
+            return self._hashes[key][field]
+
+    def hgetall(self, key: str) -> Dict[str, int]:
+        with self._lock:
+            self._is_expired(key)
+            return dict(self._hashes.get(key, {}))
+
+    def delete(self, *keys):
+        with self._lock:
+            for k in keys:
+                self._strings.pop(k, None)
+                self._zsets.pop(k, None)
+                self._sets.pop(k, None)
+                self._hashes.pop(k, None)
+                self._expirations.pop(k, None)
+
+    def keys(self, pattern: str) -> List[str]:
+        with self._lock:
+            prefix = pattern.replace("*", "")
+            all_k = list(self._strings.keys()) + list(self._zsets.keys()) + list(self._sets.keys()) + list(self._hashes.keys())
+            return [k for k in all_k if k.startswith(prefix) and not self._is_expired(k)]
+
+
+class TestDistributedGovernanceStore:
+    """Tests verifying RedisGovernanceStore atomic rate limiting, concurrency and cost tracking."""
+
+    @pytest.fixture
+    def fake_redis_store(self):
+        from app.core.resource_governor import RedisGovernanceStore
+        fake_client = FakeRedisClient()
+        return RedisGovernanceStore(fake_client, key_prefix="test:gov:")
+
+    def test_redis_sliding_window_rate_limiting(self, fake_redis_store):
+        """Should enforce sliding-window rate limit with exact token counts."""
+        store = fake_redis_store
+        # Limit: 2 requests per 60 seconds
+        allowed1, retry1, count1 = store.check_rate_limit("user:1", max_requests=2, window_seconds=60)
+        assert allowed1 is True
+        assert count1 == 1
+
+        allowed2, retry2, count2 = store.check_rate_limit("user:1", max_requests=2, window_seconds=60)
+        assert allowed2 is True
+        assert count2 == 2
+
+        allowed3, retry3, count3 = store.check_rate_limit("user:1", max_requests=2, window_seconds=60)
+        assert allowed3 is False
+        assert retry3 > 0
+        assert count3 == 2
+
+    def test_redis_concurrency_leasing_and_release(self, fake_redis_store):
+        """Should acquire up to limit and release accurately."""
+        store = fake_redis_store
+        # Limit 2
+        assert store.acquire_concurrency("pipeline", limit=2, holder_id="worker-A") is True
+        assert store.acquire_concurrency("pipeline", limit=2, holder_id="worker-B") is True
+        # Exceeded
+        assert store.acquire_concurrency("pipeline", limit=2, holder_id="worker-C") is False
+        # Duplicate rejected
+        assert store.acquire_concurrency("pipeline", limit=2, holder_id="worker-A") is False
+
+        # Release worker-A
+        store.release_concurrency("pipeline", holder_id="worker-A")
+        # Now worker-C can acquire
+        assert store.acquire_concurrency("pipeline", limit=2, holder_id="worker-C") is True
+
+    def test_redis_distributed_cost_counters(self, fake_redis_store):
+        """Should atomically increment cost metrics."""
+        store = fake_redis_store
+        store.record_cost_counter("embedding_calls", delta=5)
+        store.record_cost_counter("embedding_items_total", delta=250)
+        store.record_external_request("google_news", delta=3)
+
+        usage = store.get_cost_usage()
+        assert usage["embedding_calls"] == 5
+        assert usage["embedding_items_total"] == 250
+        assert usage["external_requests"]["google_news"] == 3
+
+
+class TestGovernanceCoordinatorFallback:
+    """Tests verifying coordinator fallback, circuit breaker, and health reporting."""
+
+    def test_default_memory_coordinator_health(self):
+        from app.core.resource_governor import GovernanceCoordinator
+        coord = GovernanceCoordinator()
+        info = coord.get_backend_info()
+        assert info["backend"] == "memory"
+        assert info["is_healthy"] is True
+        assert info["fallback_active"] is False
+
+    def test_redis_failure_triggers_memory_fallback(self, monkeypatch):
+        """When Redis operations fail, coordinator should automatically fall back to memory."""
+        from app.core.resource_governor import GovernanceCoordinator, RedisGovernanceStore
+
+        class FailingRedisClient(FakeRedisClient):
+            def eval(self, *args, **kwargs):
+                raise ConnectionError("Simulated Redis network partition")
+
+        coord = GovernanceCoordinator()
+        coord._backend_type = "redis"
+        coord.redis_store = RedisGovernanceStore(FailingRedisClient())
+
+        # Calling check_rate_limit should NOT raise an exception; it should fall back to memory
+        allowed, retry_after, count = coord._execute("check_rate_limit", "test_key", 5, 60)
+        assert allowed is True
+
+        info = coord.get_backend_info()
+        assert info["backend"] == "memory"
+        assert info["fallback_active"] is True
+        assert "Simulated Redis" in info["last_error"]
+
+
+class TestMultiWorkerConcurrencyCoordination:
+    """Multi-threaded tests simulating distinct worker processes competing for shared resources."""
+
+    def test_multi_worker_contention(self):
+        """10 threads simulating separate workers contending for 3 concurrency slots."""
+        import concurrent.futures
+        from app.core.resource_governor import ConcurrencyGovernor, GovernanceCoordinator, RedisGovernanceStore
+
+        fake_client = FakeRedisClient()
+        shared_redis_store = RedisGovernanceStore(fake_client)
+
+        # Create coordinator configured to use the shared store
+        coord = GovernanceCoordinator()
+        coord._backend_type = "redis"
+        coord.redis_store = shared_redis_store
+
+        gov = ConcurrencyGovernor(coordinator=coord)
+        gov._limits["pipeline"] = 3
+
+        acquired_workers = []
+        lock = threading.Lock()
+
+        def worker_task(worker_id: str):
+            acquired = gov.acquire("pipeline", holder_id=worker_id)
+            if acquired:
+                with lock:
+                    acquired_workers.append(worker_id)
+                time.sleep(0.01)
+                gov.release("pipeline", holder_id=worker_id)
+            return acquired
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(worker_task, f"proc-{i}") for i in range(10)]
+            results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        # At least 3 workers should have acquired, and all slots should be freed at the end
+        assert sum(results) >= 3
+        usage = gov.get_usage()
+        assert usage["pipeline"]["current"] == 0
+
 

@@ -1,17 +1,18 @@
-"""Production Cost Control, Rate Limiting & Resource Governance.
+"""Production Cost Control, Rate Limiting, Resource Governance & Distributed Multi-Worker Coordination.
 
-Provides lightweight, in-process mechanisms for:
-- API rate limiting (sliding window token buckets)
-- Resource budget enforcement
-- Cost-control tracking (embedding/synthesis calls, tokens, items)
-- Concurrency governance (pipelines, source calls, backups)
+Provides robust, pluggable governance mechanisms for:
+- API rate limiting (distributed sliding window token buckets via Redis / in-process fallback)
+- Concurrency governance (distributed leasing with TTL and deadlock prevention)
+- Resource budget enforcement & clamp guards
+- Cost-control tracking (distributed counters for embedding/synthesis calls, tokens, items)
 - External API request governance (per-source budgets, retries, backoff)
 - Utilization monitoring with configurable warning thresholds
+- Automatic zero-downtime graceful fallback to in-memory coordination on shared store disruption
 
-All classes are thread-safe and use bounded data structures.
-No external dependencies (Redis, etc.) required.
+Thread-safe, bounded memory, zero hardcoded secrets.
 """
 
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -19,12 +20,13 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+import uuid
 
 logger = logging.getLogger("app.core.resource_governor")
 
 # ==========================================
-# Rate Limiter
+# Default Configurations
 # ==========================================
 
 # Default rate limit configurations: (max_requests, window_seconds)
@@ -46,27 +48,775 @@ DEFAULT_RATE_LIMITS: Dict[str, Tuple[int, int]] = {
 }
 
 
+# ==========================================
+# Storage Abstraction Interface
+# ==========================================
+
+
+class BaseGovernanceStore(ABC):
+    """Abstract interface for governance storage backends (In-Memory, Redis, etc.)."""
+
+    @abstractmethod
+    def check_rate_limit(
+        self, key: str, max_requests: int, window_seconds: int
+    ) -> Tuple[bool, float, int]:
+        """Check if request is permitted. Returns (allowed, retry_after, current_count)."""
+        pass
+
+    @abstractmethod
+    def get_rate_limit_usage(
+        self, limits: Dict[str, Tuple[int, int]]
+    ) -> Dict[str, Any]:
+        """Get current rate limit usage for configured limits."""
+        pass
+
+    @abstractmethod
+    def acquire_concurrency(
+        self, resource: str, limit: int, holder_id: Optional[str] = None, ttl_seconds: int = 120
+    ) -> bool:
+        """Attempt to acquire concurrency slot. Returns True if acquired."""
+        pass
+
+    @abstractmethod
+    def release_concurrency(
+        self, resource: str, holder_id: Optional[str] = None
+    ) -> None:
+        """Release held concurrency slot."""
+        pass
+
+    @abstractmethod
+    def get_concurrency_usage(
+        self, limits: Dict[str, int]
+    ) -> Dict[str, Any]:
+        """Get current concurrency usage."""
+        pass
+
+    @abstractmethod
+    def release_all_concurrency(self) -> None:
+        """Release all held concurrency slots (for shutdown)."""
+        pass
+
+    @abstractmethod
+    def record_cost_counter(self, counter_name: str, delta: int = 1) -> None:
+        """Increment cost counter."""
+        pass
+
+    @abstractmethod
+    def record_external_request(self, source: str, delta: int = 1) -> None:
+        """Increment external request count for source."""
+        pass
+
+    @abstractmethod
+    def get_cost_usage(self) -> Dict[str, Any]:
+        """Get tracked cost counters and external requests."""
+        pass
+
+    @abstractmethod
+    def reset_cost_usage(self) -> None:
+        """Reset cost counters (for testing)."""
+        pass
+
+    @abstractmethod
+    def check_synthesis_rate(
+        self, topic_slug: str, limit: int, window_seconds: int = 3600
+    ) -> Tuple[bool, int, int]:
+        """Check and record synthesis rate. Returns (allowed, current_count, limit)."""
+        pass
+
+    @abstractmethod
+    def get_synthesis_usage(
+        self, limit: int, topic_slug: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get synthesis rate usage."""
+        pass
+
+    @abstractmethod
+    def is_healthy(self) -> bool:
+        """Health check for the store."""
+        pass
+
+    @abstractmethod
+    def get_backend_name(self) -> str:
+        """Return backend identifier name."""
+        pass
+
+
+# ==========================================
+# In-Process In-Memory Governance Store
+# ==========================================
+
+
 @dataclass
 class _RateBucket:
-    """Tracks request timestamps for a single rate limit key."""
+    """Tracks request timestamps for a single in-process rate limit key."""
     timestamps: List[float] = field(default_factory=list)
     last_access: float = 0.0
 
 
-class InProcessRateLimiter:
-    """Sliding-window rate limiter with bounded memory and periodic cleanup.
+class InMemoryGovernanceStore(BaseGovernanceStore):
+    """Thread-safe in-process governance store with bounded LRU memory management."""
 
-    Each key maintains a list of recent request timestamps. Expired entries
-    are pruned on every check_rate_limit call and via periodic cleanup.
-    """
+    MAX_BUCKETS = 10000
+    CLEANUP_INTERVAL = 300.0
 
-    MAX_BUCKETS = 10000  # Hard cap on tracked keys to prevent unbounded growth
-    CLEANUP_INTERVAL = 300.0  # Seconds between full cleanup sweeps
-
-    def __init__(self, limits: Optional[Dict[str, Tuple[int, int]]] = None):
+    def __init__(self):
         self._lock = threading.Lock()
         self._buckets: Dict[str, _RateBucket] = {}
         self._last_cleanup = time.monotonic()
+
+        # Concurrency state
+        self._concurrency_counts: Dict[str, int] = defaultdict(int)
+        self._concurrency_holders: Dict[str, Set[str]] = defaultdict(set)
+        self._holder_timestamps: Dict[Tuple[str, str], float] = {}
+
+        # Cost tracking state
+        self._cost_counters: Dict[str, int] = {
+            "embedding_calls": 0,
+            "embedding_items_total": 0,
+            "synthesis_calls": 0,
+            "estimated_input_tokens": 0,
+            "estimated_output_tokens": 0,
+            "items_processed": 0,
+            "pipeline_invocations": 0,
+        }
+        self._source_requests: Dict[str, int] = defaultdict(int)
+
+        # Synthesis rate tracking state
+        self._synthesis_timestamps: Dict[str, List[float]] = defaultdict(list)
+
+    def cleanup_expired_buckets(self, max_idle_seconds: float = 300.0) -> int:
+        """Explicitly purge expired rate limit buckets."""
+        now = time.monotonic()
+        with self._lock:
+            expired_keys = [
+                k for k, b in self._buckets.items()
+                if now - b.last_access > max_idle_seconds
+            ]
+            for k in expired_keys:
+                del self._buckets[k]
+            return len(expired_keys)
+
+    def _cleanup_expired(self, now: float):
+        """Evict stale rate buckets and expired concurrency leases."""
+        expired_keys = [
+            k for k, b in self._buckets.items()
+            if now - b.last_access > 3600.0
+        ]
+        for k in expired_keys:
+            del self._buckets[k]
+
+    def check_rate_limit(
+        self, key: str, max_requests: int, window_seconds: int
+    ) -> Tuple[bool, float, int]:
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_cleanup > self.CLEANUP_INTERVAL:
+                self._cleanup_expired(now)
+                self._last_cleanup = now
+
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                if len(self._buckets) >= self.MAX_BUCKETS:
+                    oldest_key = min(self._buckets, key=lambda k: self._buckets[k].last_access)
+                    del self._buckets[oldest_key]
+                bucket = _RateBucket()
+                self._buckets[key] = bucket
+
+            cutoff = now - window_seconds
+            bucket.timestamps = [t for t in bucket.timestamps if t > cutoff]
+
+            if len(bucket.timestamps) < max_requests:
+                bucket.timestamps.append(now)
+                bucket.last_access = now
+                return True, 0.0, len(bucket.timestamps)
+
+            oldest_in_window = bucket.timestamps[0]
+            retry_after = (oldest_in_window + window_seconds) - now
+            retry_after = max(0.1, retry_after)
+            return False, round(retry_after, 1), len(bucket.timestamps)
+
+    def get_rate_limit_usage(
+        self, limits: Dict[str, Tuple[int, int]]
+    ) -> Dict[str, Any]:
+        now = time.monotonic()
+        result = {}
+        with self._lock:
+            for key, (max_requests, window_seconds) in limits.items():
+                bucket = self._buckets.get(key)
+                if bucket:
+                    cutoff = now - window_seconds
+                    current = len([t for t in bucket.timestamps if t > cutoff])
+                else:
+                    current = 0
+                result[key] = {
+                    "current": current,
+                    "limit": max_requests,
+                    "window_seconds": window_seconds,
+                    "utilization_pct": round((current / max_requests) * 100, 1) if max_requests > 0 else 0.0,
+                }
+        return result
+
+    def acquire_concurrency(
+        self, resource: str, limit: int, holder_id: Optional[str] = None, ttl_seconds: int = 120
+    ) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            # Prune expired holder leases for this resource
+            if resource in self._concurrency_holders:
+                expired_holders = [
+                    h for h in list(self._concurrency_holders[resource])
+                    if now - self._holder_timestamps.get((resource, h), 0) > ttl_seconds
+                ]
+                for h in expired_holders:
+                    self._concurrency_holders[resource].discard(h)
+                    self._holder_timestamps.pop((resource, h), None)
+                self._concurrency_counts[resource] = len(self._concurrency_holders[resource])
+
+            if limit <= 0:
+                return True
+
+            if holder_id and holder_id in self._concurrency_holders[resource]:
+                logger.warning("Duplicate concurrency acquire for %s by %s", resource, holder_id)
+                return False
+
+            current = self._concurrency_counts[resource]
+            if current >= limit:
+                return False
+
+            self._concurrency_counts[resource] = current + 1
+            if holder_id:
+                self._concurrency_holders[resource].add(holder_id)
+                self._holder_timestamps[(resource, holder_id)] = now
+            return True
+
+    def release_concurrency(
+        self, resource: str, holder_id: Optional[str] = None
+    ) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if holder_id and resource in self._concurrency_holders:
+                if holder_id in self._concurrency_holders[resource]:
+                    self._concurrency_holders[resource].discard(holder_id)
+                    self._holder_timestamps.pop((resource, holder_id), None)
+                    self._concurrency_counts[resource] = len(self._concurrency_holders[resource])
+            else:
+                current = self._concurrency_counts.get(resource, 0)
+                if current > 0:
+                    self._concurrency_counts[resource] = current - 1
+
+    def get_concurrency_usage(
+        self, limits: Dict[str, int]
+    ) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                resource: {
+                    "current": self._concurrency_counts.get(resource, 0),
+                    "limit": limit,
+                    "utilization_pct": round(
+                        (self._concurrency_counts.get(resource, 0) / limit) * 100, 1
+                    ) if limit > 0 else 0.0,
+                }
+                for resource, limit in limits.items()
+            }
+
+    def release_all_concurrency(self) -> None:
+        with self._lock:
+            self._concurrency_counts.clear()
+            self._concurrency_holders.clear()
+            self._holder_timestamps.clear()
+
+    def record_cost_counter(self, counter_name: str, delta: int = 1) -> None:
+        with self._lock:
+            if counter_name in self._cost_counters:
+                self._cost_counters[counter_name] += delta
+
+    def record_external_request(self, source: str, delta: int = 1) -> None:
+        with self._lock:
+            self._source_requests[source] += delta
+
+    def get_cost_usage(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                **dict(self._cost_counters),
+                "external_requests": dict(self._source_requests),
+            }
+
+    def reset_cost_usage(self) -> None:
+        with self._lock:
+            for k in self._cost_counters:
+                self._cost_counters[k] = 0
+            self._source_requests.clear()
+
+    def check_synthesis_rate(
+        self, topic_slug: str, limit: int, window_seconds: int = 3600
+    ) -> Tuple[bool, int, int]:
+        now = time.monotonic()
+        cutoff = now - float(window_seconds)
+        with self._lock:
+            timestamps = self._synthesis_timestamps[topic_slug]
+            timestamps = [t for t in timestamps if t > cutoff]
+
+            if len(timestamps) >= limit:
+                self._synthesis_timestamps[topic_slug] = timestamps
+                return False, len(timestamps), limit
+
+            timestamps.append(now)
+            self._synthesis_timestamps[topic_slug] = timestamps
+            return True, len(timestamps), limit
+
+    def get_synthesis_usage(
+        self, limit: int, topic_slug: Optional[str] = None
+    ) -> Dict[str, Any]:
+        now = time.monotonic()
+        cutoff = now - 3600.0
+        with self._lock:
+            if topic_slug:
+                timestamps = self._synthesis_timestamps.get(topic_slug, [])
+                current = len([t for t in timestamps if t > cutoff])
+                return {
+                    "topic_slug": topic_slug,
+                    "current_hour": current,
+                    "limit": limit,
+                }
+            result = {}
+            for slug, timestamps in self._synthesis_timestamps.items():
+                current = len([t for t in timestamps if t > cutoff])
+                if current > 0:
+                    result[slug] = {
+                        "current_hour": current,
+                        "limit": limit,
+                    }
+            return result
+
+    def is_healthy(self) -> bool:
+        return True
+
+    def get_backend_name(self) -> str:
+        return "memory"
+
+
+# ==========================================
+# Redis Distributed Governance Store
+# ==========================================
+
+# Atomic sliding-window rate limit Lua script
+# Returns [allowed (0/1), retry_after (float), current_count (int)]
+REDIS_SLIDING_WINDOW_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local member = ARGV[4]
+local clearBefore = now - window
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', clearBefore)
+local currentCount = redis.call('ZCARD', key)
+
+if currentCount < limit then
+    redis.call('ZADD', key, now, member)
+    redis.call('EXPIRE', key, math.ceil(window) + 15)
+    return {1, 0.0, currentCount + 1}
+else
+    local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+    local retryAfter = 0.1
+    if oldest and #oldest >= 2 then
+        local oldestScore = tonumber(oldest[2])
+        retryAfter = (oldestScore + window) - now
+        if retryAfter < 0.1 then retryAfter = 0.1 end
+    end
+    return {0, retryAfter, currentCount}
+end
+"""
+
+# Atomic concurrency acquire Lua script
+# Returns 1 if acquired, 0 if rejected
+REDIS_CONCURRENCY_ACQUIRE_LUA = """
+local holdersKey = KEYS[1]
+local leaseKey = KEYS[2]
+local holder = ARGV[1]
+local limit = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+
+-- Check if holder already acquired
+if redis.call('SISMEMBER', holdersKey, holder) == 1 then
+    return 0
+end
+
+-- Prune expired member leases
+local allHolders = redis.call('SMEMBERS', holdersKey)
+for _, h in ipairs(allHolders) do
+    local lk = holdersKey .. ':lease:' .. h
+    if redis.call('EXISTS', lk) == 0 then
+        redis.call('SREM', holdersKey, h)
+    end
+end
+
+local current = redis.call('SCARD', holdersKey)
+if limit > 0 and current >= limit then
+    return 0
+end
+
+redis.call('SADD', holdersKey, holder)
+redis.call('SET', leaseKey, 1, 'EX', ttl)
+return 1
+"""
+
+# Atomic concurrency release Lua script
+REDIS_CONCURRENCY_RELEASE_LUA = """
+local holdersKey = KEYS[1]
+local leaseKey = KEYS[2]
+local holder = ARGV[1]
+
+redis.call('SREM', holdersKey, holder)
+redis.call('DEL', leaseKey)
+return 1
+"""
+
+
+class RedisGovernanceStore(BaseGovernanceStore):
+    """Distributed governance store backed by Redis with atomic Lua scripting and TTLs."""
+
+    def __init__(
+        self,
+        redis_client: Any,
+        key_prefix: str = "vantage:gov:",
+    ):
+        self.client = redis_client
+        self.prefix = key_prefix
+        self._rate_script = None
+        self._acquire_script = None
+        self._release_script = None
+        self._init_scripts()
+
+    def _init_scripts(self):
+        """Register Lua scripts with Redis for high-performance atomic execution."""
+        try:
+            self._rate_script = self.client.register_script(REDIS_SLIDING_WINDOW_LUA)
+            self._acquire_script = self.client.register_script(REDIS_CONCURRENCY_ACQUIRE_LUA)
+            self._release_script = self.client.register_script(REDIS_CONCURRENCY_RELEASE_LUA)
+        except Exception as e:
+            logger.debug("Script pre-registration note: %s", str(e))
+
+    def _k(self, name: str) -> str:
+        return f"{self.prefix}{name}"
+
+    def check_rate_limit(
+        self, key: str, max_requests: int, window_seconds: int
+    ) -> Tuple[bool, float, int]:
+        r_key = self._k(f"ratelimit:{key}")
+        now = time.time()
+        member_id = f"{now}:{uuid.uuid4().hex[:8]}"
+
+        if self._rate_script is not None:
+            res = self._rate_script(
+                keys=[r_key],
+                args=[str(now), str(window_seconds), str(max_requests), member_id],
+            )
+        else:
+            res = self.client.eval(
+                REDIS_SLIDING_WINDOW_LUA,
+                1,
+                r_key,
+                str(now),
+                str(window_seconds),
+                str(max_requests),
+                member_id,
+            )
+
+        allowed = bool(res[0] == 1)
+        retry_after = round(float(res[1]), 1)
+        current = int(res[2])
+        return allowed, retry_after, current
+
+    def get_rate_limit_usage(
+        self, limits: Dict[str, Tuple[int, int]]
+    ) -> Dict[str, Any]:
+        now = time.time()
+        result = {}
+        pipeline = self.client.pipeline()
+        for key, (max_requests, window_seconds) in limits.items():
+            r_key = self._k(f"ratelimit:{key}")
+            clear_before = now - window_seconds
+            pipeline.zremrangebyscore(r_key, "-inf", clear_before)
+            pipeline.zcard(r_key)
+
+        responses = pipeline.execute()
+        idx = 0
+        for key, (max_requests, window_seconds) in limits.items():
+            # response 0: zremrangebyscore, response 1: zcard
+            _ = responses[idx]
+            current = int(responses[idx + 1])
+            idx += 2
+            result[key] = {
+                "current": current,
+                "limit": max_requests,
+                "window_seconds": window_seconds,
+                "utilization_pct": round((current / max_requests) * 100, 1) if max_requests > 0 else 0.0,
+            }
+        return result
+
+    def acquire_concurrency(
+        self, resource: str, limit: int, holder_id: Optional[str] = None, ttl_seconds: int = 120
+    ) -> bool:
+        if limit <= 0:
+            return True
+
+        h_id = holder_id or uuid.uuid4().hex
+        holders_key = self._k(f"concurrency:{resource}:holders")
+        lease_key = self._k(f"concurrency:{resource}:lease:{h_id}")
+
+        if self._acquire_script is not None:
+            res = self._acquire_script(
+                keys=[holders_key, lease_key],
+                args=[h_id, str(limit), str(ttl_seconds)],
+            )
+        else:
+            res = self.client.eval(
+                REDIS_CONCURRENCY_ACQUIRE_LUA,
+                2,
+                holders_key,
+                lease_key,
+                h_id,
+                str(limit),
+                str(ttl_seconds),
+            )
+        return bool(res == 1)
+
+    def release_concurrency(
+        self, resource: str, holder_id: Optional[str] = None
+    ) -> None:
+        if not holder_id:
+            return
+
+        holders_key = self._k(f"concurrency:{resource}:holders")
+        lease_key = self._k(f"concurrency:{resource}:lease:{holder_id}")
+
+        if self._release_script is not None:
+            self._release_script(keys=[holders_key, lease_key], args=[holder_id])
+        else:
+            self.client.eval(
+                REDIS_CONCURRENCY_RELEASE_LUA,
+                2,
+                holders_key,
+                lease_key,
+                holder_id,
+            )
+
+    def get_concurrency_usage(
+        self, limits: Dict[str, int]
+    ) -> Dict[str, Any]:
+        result = {}
+        for resource, limit in limits.items():
+            holders_key = self._k(f"concurrency:{resource}:holders")
+            members = self.client.smembers(holders_key)
+            valid_count = 0
+            if members:
+                for m in members:
+                    member_str = m.decode("utf-8") if isinstance(m, bytes) else str(m)
+                    lease_key = self._k(f"concurrency:{resource}:lease:{member_str}")
+                    if self.client.exists(lease_key):
+                        valid_count += 1
+                    else:
+                        self.client.srem(holders_key, member_str)
+            result[resource] = {
+                "current": valid_count,
+                "limit": limit,
+                "utilization_pct": round((valid_count / limit) * 100, 1) if limit > 0 else 0.0,
+            }
+        return result
+
+    def release_all_concurrency(self) -> None:
+        try:
+            pattern = self._k("concurrency:*")
+            keys = self.client.keys(pattern)
+            if keys:
+                self.client.delete(*keys)
+        except Exception as e:
+            logger.warning("Failed to release all concurrency in Redis: %s", str(e))
+
+    def record_cost_counter(self, counter_name: str, delta: int = 1) -> None:
+        self.client.hincrby(self._k("cost:counters"), counter_name, delta)
+
+    def record_external_request(self, source: str, delta: int = 1) -> None:
+        self.client.hincrby(self._k("cost:sources"), source, delta)
+
+    def get_cost_usage(self) -> Dict[str, Any]:
+        raw_counters = self.client.hgetall(self._k("cost:counters")) or {}
+        raw_sources = self.client.hgetall(self._k("cost:sources")) or {}
+
+        def _decode_dict(d):
+            return {
+                (k.decode("utf-8") if isinstance(k, bytes) else str(k)): int(v)
+                for k, v in d.items()
+            }
+
+        counters = _decode_dict(raw_counters)
+        sources = _decode_dict(raw_sources)
+
+        base_fields = [
+            "embedding_calls",
+            "embedding_items_total",
+            "synthesis_calls",
+            "estimated_input_tokens",
+            "estimated_output_tokens",
+            "items_processed",
+            "pipeline_invocations",
+        ]
+        res = {f: counters.get(f, 0) for f in base_fields}
+        res["external_requests"] = sources
+        return res
+
+    def reset_cost_usage(self) -> None:
+        self.client.delete(self._k("cost:counters"), self._k("cost:sources"))
+
+    def check_synthesis_rate(
+        self, topic_slug: str, limit: int, window_seconds: int = 3600
+    ) -> Tuple[bool, int, int]:
+        key = f"synthesis:{topic_slug}"
+        allowed, _, current = self.check_rate_limit(key, limit, window_seconds)
+        return allowed, current, limit
+
+    def get_synthesis_usage(
+        self, limit: int, topic_slug: Optional[str] = None
+    ) -> Dict[str, Any]:
+        now = time.time()
+        if topic_slug:
+            key = self._k(f"ratelimit:synthesis:{topic_slug}")
+            self.client.zremrangebyscore(key, "-inf", now - 3600)
+            current = self.client.zcard(key) or 0
+            return {
+                "topic_slug": topic_slug,
+                "current_hour": current,
+                "limit": limit,
+            }
+
+        result = {}
+        pattern = self._k("ratelimit:synthesis:*")
+        keys = self.client.keys(pattern) or []
+        for k in keys:
+            k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+            slug = k_str.split("synthesis:")[-1]
+            self.client.zremrangebyscore(k_str, "-inf", now - 3600)
+            cnt = self.client.zcard(k_str) or 0
+            if cnt > 0:
+                result[slug] = {
+                    "current_hour": cnt,
+                    "limit": limit,
+                }
+        return result
+
+    def is_healthy(self) -> bool:
+        try:
+            return bool(self.client.ping())
+        except Exception:
+            return False
+
+    def get_backend_name(self) -> str:
+        return "redis"
+
+
+# ==========================================
+# Governance Coordinator (Circuit-Breaker)
+# ==========================================
+
+
+class GovernanceCoordinator:
+    """Coordinates storage backends with zero-downtime automatic fallback to memory on Redis outage."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.in_memory_store = InMemoryGovernanceStore()
+        self.redis_store: Optional[RedisGovernanceStore] = None
+        self._backend_type = os.getenv("GOVERNANCE_BACKEND", "memory").lower()
+        self._fallback_allowed = os.getenv("GOVERNANCE_FALLBACK_TO_MEMORY", "true").lower() in ("true", "1", "yes")
+        self._fallback_active = False
+        self._last_error: Optional[str] = None
+        self._last_log_time = 0.0
+
+        if self._backend_type == "redis":
+            self._init_redis()
+
+    def _init_redis(self):
+        """Attempt Redis connection initialization with strict timeouts."""
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        key_prefix = os.getenv("REDIS_KEY_PREFIX", "vantage:gov:")
+        conn_timeout = float(os.getenv("REDIS_CONNECT_TIMEOUT_MS", "500")) / 1000.0
+        socket_timeout = float(os.getenv("REDIS_SOCKET_TIMEOUT_MS", "500")) / 1000.0
+
+        try:
+            import redis
+            client = redis.Redis.from_url(
+                redis_url,
+                socket_connect_timeout=conn_timeout,
+                socket_timeout=socket_timeout,
+                decode_responses=False,
+            )
+            client.ping()
+            self.redis_store = RedisGovernanceStore(client, key_prefix=key_prefix)
+            self._fallback_active = False
+            logger.info("GovernanceCoordinator: connected to Redis shared backend (%s)", redis_url.split("@")[-1])
+        except Exception as e:
+            self._last_error = f"Redis connection failed: {str(e)[:100]}"
+            self._fallback_active = True
+            logger.warning("GovernanceCoordinator: Redis unavailable (%s). Falling back to in-memory coordination.", self._last_error)
+
+    def _execute(self, method_name: str, *args, **kwargs) -> Any:
+        """Execute method on active store with automatic fallback on failure."""
+        if self._backend_type == "redis" and self.redis_store is not None and not self._fallback_active:
+            try:
+                method = getattr(self.redis_store, method_name)
+                return method(*args, **kwargs)
+            except Exception as e:
+                now = time.monotonic()
+                if now - self._last_log_time > 30.0:
+                    logger.warning("Redis governance error on %s: %s. Falling back to in-process memory store.", method_name, str(e)[:100])
+                    self._last_log_time = now
+                self._last_error = str(e)[:100]
+                if self._fallback_allowed:
+                    self._fallback_active = True
+
+        # In-memory execution
+        method = getattr(self.in_memory_store, method_name)
+        return method(*args, **kwargs)
+
+    def get_backend_info(self) -> Dict[str, Any]:
+        """Return operational metadata about active governance backend."""
+        is_redis_target = self._backend_type == "redis"
+        active_name = "redis" if (is_redis_target and not self._fallback_active and self.redis_store is not None) else "memory"
+        is_healthy = self.in_memory_store.is_healthy() if active_name == "memory" else (self.redis_store.is_healthy() if self.redis_store else False)
+
+        return {
+            "backend": active_name,
+            "configured_backend": self._backend_type,
+            "is_healthy": is_healthy,
+            "fallback_active": self._fallback_active,
+            "fallback_allowed": self._fallback_allowed,
+            "redis_configured": is_redis_target,
+            "last_error": self._last_error,
+        }
+
+    def reset_fallback(self) -> bool:
+        """Attempt to reconnect to Redis and reset fallback state."""
+        if self._backend_type == "redis":
+            self._init_redis()
+            return not self._fallback_active
+        return True
+
+
+# ==========================================
+# Public Facing Governors & Managers
+# ==========================================
+
+
+class InProcessRateLimiter:
+    """Sliding-window rate limiter delegating to active coordinator store."""
+
+    def __init__(
+        self,
+        limits: Optional[Dict[str, Tuple[int, int]]] = None,
+        coordinator: Optional[GovernanceCoordinator] = None,
+    ):
+        self._coordinator = coordinator or GovernanceCoordinator()
         self._limits = dict(DEFAULT_RATE_LIMITS)
         if limits:
             self._limits.update(limits)
@@ -84,102 +834,44 @@ class InProcessRateLimiter:
                     logger.warning("Invalid rate limit env override %s=%s", env_key, env_val)
 
     def check_rate_limit(self, key: str) -> Tuple[bool, float]:
-        """Check if a request is allowed for the given key.
-
-        Returns:
-            (allowed, retry_after): allowed=True if request is within limit,
-            retry_after=seconds until next slot opens (0.0 if allowed).
-        """
-        now = time.monotonic()
-
+        """Check if request is allowed for key. Returns (allowed, retry_after)."""
         limit_config = self._limits.get(key)
         if not limit_config:
             return True, 0.0
 
         max_requests, window_seconds = limit_config
-
-        with self._lock:
-            # Periodic cleanup of all stale buckets
-            if now - self._last_cleanup > self.CLEANUP_INTERVAL:
-                self._cleanup_expired(now)
-                self._last_cleanup = now
-
-            bucket = self._buckets.get(key)
-            if bucket is None:
-                if len(self._buckets) >= self.MAX_BUCKETS:
-                    # Evict oldest bucket to prevent unbounded growth
-                    oldest_key = min(self._buckets, key=lambda k: self._buckets[k].last_access)
-                    del self._buckets[oldest_key]
-                bucket = _RateBucket()
-                self._buckets[key] = bucket
-
-            # Prune timestamps outside the current window
-            cutoff = now - window_seconds
-            bucket.timestamps = [t for t in bucket.timestamps if t > cutoff]
-
-            if len(bucket.timestamps) < max_requests:
-                bucket.timestamps.append(now)
-                bucket.last_access = now
-                return True, 0.0
-
-            # Calculate retry_after from the oldest timestamp in the window
-            oldest_in_window = bucket.timestamps[0]
-            retry_after = (oldest_in_window + window_seconds) - now
-            retry_after = max(0.1, retry_after)  # Ensure minimum positive value
-            return False, round(retry_after, 1)
+        allowed, retry_after, _ = self._coordinator._execute(
+            "check_rate_limit", key, max_requests, window_seconds
+        )
+        return allowed, retry_after
 
     def get_usage(self) -> Dict[str, Any]:
-        """Return current rate limit usage for all configured keys."""
-        now = time.monotonic()
-        result = {}
-        with self._lock:
-            for key, (max_requests, window_seconds) in self._limits.items():
-                bucket = self._buckets.get(key)
-                if bucket:
-                    cutoff = now - window_seconds
-                    current = len([t for t in bucket.timestamps if t > cutoff])
-                else:
-                    current = 0
-                result[key] = {
-                    "current": current,
-                    "limit": max_requests,
-                    "window_seconds": window_seconds,
-                    "utilization_pct": round((current / max_requests) * 100, 1) if max_requests > 0 else 0.0,
-                }
-        return result
+        """Return current rate limit utilization for all configured keys."""
+        return self._coordinator._execute("get_rate_limit_usage", self._limits)
 
-    def _cleanup_expired(self, now: float) -> int:
-        """Remove all buckets that have had no activity within their window. Returns count removed."""
-        removed = 0
-        keys_to_remove = []
-        for key, bucket in self._buckets.items():
-            max_window = self._limits.get(key, (0, 60))[1]
-            if now - bucket.last_access > max_window * 2:
-                keys_to_remove.append(key)
-        for key in keys_to_remove:
-            del self._buckets[key]
-            removed += 1
-        if removed:
-            logger.debug("Rate limiter cleanup: removed %d expired buckets", removed)
-        return removed
+    def cleanup_expired_buckets(self, max_idle_seconds: float = 300.0) -> int:
+        """Purge stale rate limit tracking buckets."""
+        return self._coordinator.in_memory_store.cleanup_expired_buckets(max_idle_seconds)
 
-    def cleanup_expired_buckets(self) -> int:
-        """Public method to trigger manual cleanup. Returns count of removed buckets."""
-        now = time.monotonic()
-        with self._lock:
-            return self._cleanup_expired(now)
+    @property
+    def _lock(self):
+        return self._coordinator.in_memory_store._lock
 
+    @property
+    def _buckets(self):
+        return self._coordinator.in_memory_store._buckets
 
-# ==========================================
-# Resource Budget Manager
-# ==========================================
+    @property
+    def _last_cleanup(self):
+        return self._coordinator.in_memory_store._last_cleanup
+
+    @_last_cleanup.setter
+    def _last_cleanup(self, value):
+        self._coordinator.in_memory_store._last_cleanup = value
 
 
 class ResourceBudgetManager:
-    """Configurable resource budgets for expensive operations.
-
-    All limits are loaded from environment variables with sensible defaults.
-    """
+    """Budget limits and item clamping guards."""
 
     def __init__(self):
         self.budgets: Dict[str, int] = {
@@ -198,121 +890,33 @@ class ResourceBudgetManager:
         }
 
     def check_budget(self, resource: str, current: int) -> Tuple[bool, int, int]:
-        """Check if current usage is within budget.
-
-        Returns:
-            (allowed, limit, current): allowed is True if current < limit.
-        """
         limit = self.budgets.get(resource)
         if limit is None:
             return True, 0, current
         return current < limit, limit, current
 
     def get_limit(self, resource: str) -> int:
-        """Get the configured limit for a resource."""
         return self.budgets.get(resource, 0)
 
     def clamp(self, resource: str, value: int) -> int:
-        """Clamp a value to the budget limit for a resource."""
         limit = self.budgets.get(resource, value)
         if value > limit:
-            logger.info(
-                "Clamping %s from %d to budget limit %d",
-                resource, value, limit,
-            )
+            logger.info("Clamping %s from %d to budget limit %d", resource, value, limit)
         return min(value, limit)
 
     def get_all_budgets(self) -> Dict[str, int]:
-        """Return all configured budgets (safe to expose, no secrets)."""
         return dict(self.budgets)
 
 
-# ==========================================
-# Cost Tracker
-# ==========================================
-
-
-class CostTracker:
-    """Persistent operational metadata tracking for cost-control visibility.
-
-    Tracks counts and estimated tokens only. Never stores prompt contents
-    or raw source text.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._counters: Dict[str, int] = {
-            "embedding_calls": 0,
-            "embedding_items_total": 0,
-            "synthesis_calls": 0,
-            "estimated_input_tokens": 0,
-            "estimated_output_tokens": 0,
-            "items_processed": 0,
-            "pipeline_invocations": 0,
-        }
-        self._source_requests: Dict[str, int] = defaultdict(int)
-
-    def record_embedding_call(self, item_count: int = 0):
-        """Record an embedding API call."""
-        with self._lock:
-            self._counters["embedding_calls"] += 1
-            self._counters["embedding_items_total"] += item_count
-
-    def record_synthesis_call(
-        self,
-        estimated_input_tokens: int = 0,
-        estimated_output_tokens: int = 0,
-    ):
-        """Record an LLM synthesis API call."""
-        with self._lock:
-            self._counters["synthesis_calls"] += 1
-            self._counters["estimated_input_tokens"] += estimated_input_tokens
-            self._counters["estimated_output_tokens"] += estimated_output_tokens
-
-    def record_items_processed(self, count: int = 1):
-        """Record items processed through pipelines."""
-        with self._lock:
-            self._counters["items_processed"] += count
-
-    def record_pipeline_invocation(self):
-        """Record a pipeline invocation."""
-        with self._lock:
-            self._counters["pipeline_invocations"] += 1
-
-    def record_external_request(self, source: str):
-        """Record an external API request for a source."""
-        with self._lock:
-            self._source_requests[source] += 1
-
-    def get_usage(self) -> Dict[str, Any]:
-        """Return all tracked counters for API exposure."""
-        with self._lock:
-            return {
-                **dict(self._counters),
-                "external_requests": dict(self._source_requests),
-            }
-
-    def reset(self):
-        """Reset all counters (for testing)."""
-        with self._lock:
-            for key in self._counters:
-                self._counters[key] = 0
-            self._source_requests.clear()
-
-
-# ==========================================
-# Concurrency Governor
-# ==========================================
-
-
 class ConcurrencyGovernor:
-    """Bounded concurrency control for expensive operations.
+    """Bounded concurrency control with distributed leasing, TTL and guaranteed release."""
 
-    Provides acquire/release semantics with guaranteed release on failure.
-    """
-
-    def __init__(self, budget_manager: Optional["ResourceBudgetManager"] = None):
-        self._lock = threading.Lock()
+    def __init__(
+        self,
+        budget_manager: Optional[ResourceBudgetManager] = None,
+        coordinator: Optional[GovernanceCoordinator] = None,
+    ):
+        self._coordinator = coordinator or GovernanceCoordinator()
         bm = budget_manager or ResourceBudgetManager()
         self._limits: Dict[str, int] = {
             "pipeline": bm.get_limit("max_concurrent_pipelines"),
@@ -320,94 +924,103 @@ class ConcurrencyGovernor:
             "backup": bm.get_limit("max_backup_operations"),
             "maintenance": bm.get_limit("max_maintenance_operations"),
         }
-        self._current: Dict[str, int] = {k: 0 for k in self._limits}
-        # Track which identifiers hold each resource to prevent duplicates
-        self._holders: Dict[str, set] = {k: set() for k in self._limits}
+        self.lease_ttl_seconds = int(os.getenv("CONCURRENCY_LEASE_TTL_SECONDS", "120"))
 
     def acquire(self, resource: str, holder_id: Optional[str] = None) -> bool:
-        """Try to acquire a concurrency slot. Returns True if successful."""
-        with self._lock:
-            limit = self._limits.get(resource, 0)
-            if limit <= 0:
-                return True  # No limit configured
-
-            # Check for duplicate holder
-            if holder_id and holder_id in self._holders.get(resource, set()):
-                logger.warning(
-                    "Duplicate concurrency acquire for %s by %s",
-                    resource, holder_id,
-                )
-                return False
-
-            current = self._current.get(resource, 0)
-            if current >= limit:
-                logger.warning(
-                    "Concurrency limit reached for %s: %d/%d",
-                    resource, current, limit,
-                )
-                return False
-
-            self._current[resource] = current + 1
-            if holder_id:
-                self._holders[resource].add(holder_id)
-            return True
+        limit = self._limits.get(resource, 0)
+        return self._coordinator._execute(
+            "acquire_concurrency", resource, limit, holder_id, self.lease_ttl_seconds
+        )
 
     def release(self, resource: str, holder_id: Optional[str] = None):
-        """Release a concurrency slot."""
-        with self._lock:
-            current = self._current.get(resource, 0)
-            if current > 0:
-                self._current[resource] = current - 1
-            if holder_id and resource in self._holders:
-                self._holders[resource].discard(holder_id)
+        self._coordinator._execute("release_concurrency", resource, holder_id)
 
     def get_usage(self) -> Dict[str, Any]:
-        """Return current concurrency usage for all resources."""
-        with self._lock:
-            return {
-                resource: {
-                    "current": self._current.get(resource, 0),
-                    "limit": limit,
-                    "utilization_pct": round(
-                        (self._current.get(resource, 0) / limit) * 100, 1
-                    ) if limit > 0 else 0.0,
-                }
-                for resource, limit in self._limits.items()
-            }
+        return self._coordinator._execute("get_concurrency_usage", self._limits)
 
     @contextmanager
     def slot(self, resource: str, holder_id: Optional[str] = None):
-        """Context manager that acquires and guarantees release of a slot.
-
-        Raises RuntimeError if the slot cannot be acquired.
-        """
         if not self.acquire(resource, holder_id=holder_id):
-            raise RuntimeError(
-                f"Concurrency limit reached for {resource}"
-            )
+            raise RuntimeError(f"Concurrency limit reached for {resource}")
         try:
             yield
         finally:
             self.release(resource, holder_id=holder_id)
 
     def release_all(self):
-        """Release all held slots (for shutdown cleanup)."""
-        with self._lock:
-            for resource in self._current:
-                self._current[resource] = 0
-            for resource in self._holders:
-                self._holders[resource].clear()
+        self._coordinator._execute("release_all_concurrency")
         logger.info("Concurrency governor: all slots released (shutdown)")
 
 
-# ==========================================
-# External Request Governor
-# ==========================================
+class CostTracker:
+    """Operational telemetry tracking for cost-control visibility."""
+
+    def __init__(self, coordinator: Optional[GovernanceCoordinator] = None):
+        self._coordinator = coordinator or GovernanceCoordinator()
+
+    def record_embedding_call(self, item_count: int = 0):
+        self._coordinator._execute("record_cost_counter", "embedding_calls", 1)
+        self._coordinator._execute("record_cost_counter", "embedding_items_total", item_count)
+
+    def record_synthesis_call(
+        self,
+        estimated_input_tokens: int = 0,
+        estimated_output_tokens: int = 0,
+    ):
+        self._coordinator._execute("record_cost_counter", "synthesis_calls", 1)
+        self._coordinator._execute("record_cost_counter", "estimated_input_tokens", estimated_input_tokens)
+        self._coordinator._execute("record_cost_counter", "estimated_output_tokens", estimated_output_tokens)
+
+    def record_items_processed(self, count: int = 1):
+        self._coordinator._execute("record_cost_counter", "items_processed", count)
+
+    def record_pipeline_invocation(self):
+        self._coordinator._execute("record_cost_counter", "pipeline_invocations", 1)
+
+    def record_external_request(self, source: str):
+        self._coordinator._execute("record_external_request", source, 1)
+
+    def get_usage(self) -> Dict[str, Any]:
+        return self._coordinator._execute("get_cost_usage")
+
+    def reset(self):
+        self._coordinator._execute("reset_cost_usage")
+
+
+class SynthesisRateTracker:
+    """Tracks synthesis calls per topic per hour to enforce budget limits."""
+
+    def __init__(
+        self,
+        max_per_topic_hour: int = 5,
+        coordinator: Optional[GovernanceCoordinator] = None,
+    ):
+        self._coordinator = coordinator or GovernanceCoordinator()
+        self.max_per_topic_hour = int(
+            os.getenv("BUDGET_MAX_SYNTHESIS_PER_TOPIC_HOUR", str(max_per_topic_hour))
+        )
+
+    def check_and_record(self, topic_slug: str) -> Tuple[bool, int, int]:
+        return self._coordinator._execute(
+            "check_synthesis_rate", topic_slug, self.max_per_topic_hour, 3600
+        )
+
+    def get_usage(self, topic_slug: Optional[str] = None) -> Dict[str, Any]:
+        return self._coordinator._execute(
+            "get_synthesis_usage", self.max_per_topic_hour, topic_slug
+        )
+
+    @property
+    def _topic_timestamps(self):
+        return self._coordinator.in_memory_store._synthesis_timestamps
+
+    @property
+    def _lock(self):
+        return self._coordinator.in_memory_store._lock
 
 
 @dataclass
 class _ExternalSourceConfig:
-    """Configuration for a single external API source."""
     max_concurrent: int = 3
     timeout_seconds: float = 15.0
     max_retries: int = 3
@@ -416,10 +1029,7 @@ class _ExternalSourceConfig:
 
 
 class ExternalRequestGovernor:
-    """Governs external API requests with per-source budgets, timeouts, and retry limits.
-
-    Prevents unbounded retries and respects provider rate limits.
-    """
+    """Governs external API requests with per-source budgets, timeouts, and retry limits."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -448,59 +1058,51 @@ class ExternalRequestGovernor:
             "openai": _ExternalSourceConfig(
                 max_concurrent=int(os.getenv("EXT_OPENAI_MAX_CONCURRENT", "5")),
                 timeout_seconds=float(os.getenv("EXT_OPENAI_TIMEOUT", "30.0")),
-                max_retries=int(os.getenv("EXT_OPENAI_MAX_RETRIES", "2")),
+                max_retries=int(os.getenv("EXT_OPENAI_MAX_RETRIES", "3")),
                 backoff_base=float(os.getenv("EXT_OPENAI_BACKOFF", "2.0")),
-                hourly_budget=int(os.getenv("EXT_OPENAI_HOURLY_BUDGET", "500")),
+                hourly_budget=int(os.getenv("EXT_OPENAI_HOURLY_BUDGET", "100")),
             ),
         }
-        self._hourly_counts: Dict[str, List[float]] = defaultdict(list)
         self._active_counts: Dict[str, int] = defaultdict(int)
+        self._hourly_counts: Dict[str, List[float]] = defaultdict(list)
 
     def check_request_allowed(self, source: str) -> Tuple[bool, str]:
-        """Check if an external request to the given source is allowed.
-
-        Returns:
-            (allowed, reason): reason is empty string if allowed.
-        """
         config = self._configs.get(source)
         if not config:
             return True, ""
 
         now = time.monotonic()
+        one_hour_ago = now - 3600.0
 
         with self._lock:
-            # Check concurrency
-            if self._active_counts[source] >= config.max_concurrent:
-                return False, f"Concurrent request limit ({config.max_concurrent}) reached for {source}"
-
-            # Check hourly budget
-            one_hour_ago = now - 3600.0
             self._hourly_counts[source] = [
-                t for t in self._hourly_counts[source] if t > one_hour_ago
+                t for t in self._hourly_counts.get(source, []) if t > one_hour_ago
             ]
-            if len(self._hourly_counts[source]) >= config.hourly_budget:
-                return False, f"Hourly request budget ({config.hourly_budget}) exhausted for {source}"
 
-        return True, ""
+            if len(self._hourly_counts[source]) >= config.hourly_budget:
+                return False, f"Hourly budget exceeded ({len(self._hourly_counts[source])}/{config.hourly_budget})"
+
+            active = self._active_counts.get(source, 0)
+            if active >= config.max_concurrent:
+                return False, f"Concurrent limit reached ({active}/{config.max_concurrent})"
+
+            return True, ""
 
     def record_request_start(self, source: str):
-        """Record that a request to the source has started."""
         with self._lock:
-            self._active_counts[source] += 1
+            self._active_counts[source] = self._active_counts.get(source, 0) + 1
             self._hourly_counts[source].append(time.monotonic())
 
     def record_request_end(self, source: str):
-        """Record that a request to the source has completed."""
         with self._lock:
-            if self._active_counts[source] > 0:
-                self._active_counts[source] -= 1
+            current = self._active_counts.get(source, 0)
+            if current > 0:
+                self._active_counts[source] = current - 1
 
-    def get_source_config(self, source: str) -> Optional[_ExternalSourceConfig]:
-        """Get the configuration for a source."""
+    def get_config(self, source: str) -> Optional[_ExternalSourceConfig]:
         return self._configs.get(source)
 
     def get_usage(self) -> Dict[str, Any]:
-        """Return current external request usage for all sources."""
         now = time.monotonic()
         result = {}
         with self._lock:
@@ -521,11 +1123,6 @@ class ExternalRequestGovernor:
         return result
 
 
-# ==========================================
-# Utilization Monitor
-# ==========================================
-
-
 class UtilizationMonitor:
     """Monitors resource utilization against configurable warning thresholds."""
 
@@ -534,15 +1131,6 @@ class UtilizationMonitor:
         self.critical_threshold = float(os.getenv("RESOURCE_CRITICAL_THRESHOLD", "0.90"))
 
     def get_status(self, current: float, limit: float) -> str:
-        """Classify utilization as normal, warning, or critical.
-
-        Args:
-            current: Current usage value.
-            limit: Maximum allowed value.
-
-        Returns:
-            'normal', 'warning', or 'critical'
-        """
         if limit <= 0:
             return "normal"
         ratio = current / limit
@@ -553,7 +1141,6 @@ class UtilizationMonitor:
         return "normal"
 
     def get_thresholds(self) -> Dict[str, float]:
-        """Return configured thresholds (safe to expose)."""
         return {
             "warning_threshold": self.warning_threshold,
             "critical_threshold": self.critical_threshold,
@@ -561,76 +1148,14 @@ class UtilizationMonitor:
 
 
 # ==========================================
-# Synthesis Rate Tracker (per topic/hour)
-# ==========================================
-
-
-class SynthesisRateTracker:
-    """Tracks synthesis calls per topic per hour to enforce budget limits."""
-
-    def __init__(self, max_per_topic_hour: int = 5):
-        self._lock = threading.Lock()
-        self.max_per_topic_hour = int(
-            os.getenv("BUDGET_MAX_SYNTHESIS_PER_TOPIC_HOUR", str(max_per_topic_hour))
-        )
-        self._topic_timestamps: Dict[str, List[float]] = {}
-
-    def check_and_record(self, topic_slug: str) -> Tuple[bool, int, int]:
-        """Check if synthesis is allowed for the topic, and record if so.
-
-        Returns:
-            (allowed, current_count, limit)
-        """
-        now = time.monotonic()
-        one_hour_ago = now - 3600.0
-
-        with self._lock:
-            timestamps = self._topic_timestamps.get(topic_slug, [])
-            # Prune expired
-            timestamps = [t for t in timestamps if t > one_hour_ago]
-            current = len(timestamps)
-
-            if current >= self.max_per_topic_hour:
-                self._topic_timestamps[topic_slug] = timestamps
-                return False, current, self.max_per_topic_hour
-
-            timestamps.append(now)
-            self._topic_timestamps[topic_slug] = timestamps
-            return True, current + 1, self.max_per_topic_hour
-
-    def get_usage(self, topic_slug: Optional[str] = None) -> Dict[str, Any]:
-        """Return synthesis rate usage."""
-        now = time.monotonic()
-        one_hour_ago = now - 3600.0
-        with self._lock:
-            if topic_slug:
-                timestamps = self._topic_timestamps.get(topic_slug, [])
-                current = len([t for t in timestamps if t > one_hour_ago])
-                return {
-                    "topic_slug": topic_slug,
-                    "current_hour": current,
-                    "limit": self.max_per_topic_hour,
-                }
-            # All topics
-            result = {}
-            for slug, timestamps in self._topic_timestamps.items():
-                current = len([t for t in timestamps if t > one_hour_ago])
-                if current > 0:
-                    result[slug] = {
-                        "current_hour": current,
-                        "limit": self.max_per_topic_hour,
-                    }
-            return result
-
-
-# ==========================================
 # Global Singleton Instances
 # ==========================================
 
-rate_limiter = InProcessRateLimiter()
+coordinator = GovernanceCoordinator()
 budget_manager = ResourceBudgetManager()
-cost_tracker = CostTracker()
-concurrency_governor = ConcurrencyGovernor(budget_manager)
+rate_limiter = InProcessRateLimiter(coordinator=coordinator)
+cost_tracker = CostTracker(coordinator=coordinator)
+concurrency_governor = ConcurrencyGovernor(budget_manager=budget_manager, coordinator=coordinator)
 external_governor = ExternalRequestGovernor()
 utilization_monitor = UtilizationMonitor()
-synthesis_tracker = SynthesisRateTracker()
+synthesis_tracker = SynthesisRateTracker(coordinator=coordinator)

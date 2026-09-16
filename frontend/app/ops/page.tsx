@@ -1463,12 +1463,29 @@ export default function OperationsPage() {
 
         {/* 7. Resource Governance Section */}
         <div className="p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-5">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <Sliders className="w-5 h-5 text-cyan-400" />
               <h2 className="text-base font-semibold text-white">Resource Governance & Cost Controls</h2>
             </div>
-            <span className="text-[11px] text-slate-400">Rate Limits • Budgets • Concurrency</span>
+            <div className="flex items-center gap-2 text-[11px]">
+              {resourceUsage?.governance_backend && (
+                <span
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-mono text-[10px] font-semibold border ${
+                    resourceUsage.governance_backend.backend === "redis"
+                      ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                      : "bg-cyan-500/10 text-cyan-400 border-cyan-500/20"
+                  }`}
+                >
+                  <Server className="w-3 h-3" />
+                  Backend: {resourceUsage.governance_backend.backend.toUpperCase()}
+                  {resourceUsage.governance_backend.fallback_active && (
+                    <span className="text-amber-400 font-bold">(FALLBACK ACTIVE)</span>
+                  )}
+                </span>
+              )}
+              <span className="text-slate-400">Rate Limits • Budgets • Concurrency</span>
+            </div>
           </div>
 
           {/* Rate Limits Grid */}
