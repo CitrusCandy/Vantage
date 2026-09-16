@@ -1,4 +1,12 @@
 from app.processing.bot_detector import BotDetectionResult, BotDetector
+from app.processing.cluster_pipeline import ClusterPipeline
+from app.processing.clustering import ClusterResult, HDBSCANClusterer
+from app.processing.embeddings import (
+    BaseEmbeddingProvider,
+    MockEmbeddingProvider,
+    OpenAIEmbeddingProvider,
+    get_embedding_provider,
+)
 from app.processing.minhash_lsh import MinHash, MinHashLSH
 from app.processing.processor import (
     DiscourseProcessor,
@@ -22,4 +30,11 @@ __all__ = [
     "DiscourseProcessor",
     "ProcessingResult",
     "ProcessingStatistics",
+    "BaseEmbeddingProvider",
+    "OpenAIEmbeddingProvider",
+    "MockEmbeddingProvider",
+    "get_embedding_provider",
+    "HDBSCANClusterer",
+    "ClusterResult",
+    "ClusterPipeline",
 ]

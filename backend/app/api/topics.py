@@ -1,6 +1,6 @@
 from datetime import datetime
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import unicodedata
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -15,6 +15,7 @@ from app.database.schemas import (
     TopicResponse,
     TopicUpdate,
 )
+from app.processing.cluster_pipeline import ClusterPipeline
 
 router = APIRouter(prefix="/topics", tags=["Topics"])
 
@@ -168,3 +169,33 @@ def delete_topic(
     db.delete(topic)
     db.commit()
     return {"message": f"Topic '{slug}' and its associated records have been deleted successfully"}
+
+
+@router.post(
+    "/{slug}/cluster",
+    status_code=status.HTTP_200_OK,
+    summary="Trigger clustering for a topic",
+)
+def cluster_topic(
+    slug: str,
+    min_volume_threshold: int = Query(
+        default=30,
+        ge=2,
+        description="Minimum usable discourse posts required before clustering",
+    ),
+    db: Session = Depends(get_db),
+):
+    """Run preprocessing, embeddings generation, HDBSCAN clustering, and persist ClusterRun."""
+    topic = db.query(Topic).filter(Topic.slug == slug).first()
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Topic with slug '{slug}' not found",
+        )
+
+    pipeline = ClusterPipeline()
+    return pipeline.run_for_topic(
+        topic=topic,
+        db=db,
+        min_volume_threshold=min_volume_threshold,
+    )

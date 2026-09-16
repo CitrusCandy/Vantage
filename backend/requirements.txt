@@ -4,3 +4,7 @@ sqlalchemy
 psycopg2-binary
 pydantic
 python-dotenv
+numpy
+scikit-learn
+httpx
+pytest
