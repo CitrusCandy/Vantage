@@ -1,4 +1,3 @@
-import base64
 from datetime import datetime
 import json
 import logging
@@ -6,180 +5,181 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
-from app.ingestion.base import BaseIngestor
-from app.ingestion.schemas import IngestedItem
+import praw
+from sqlalchemy.orm import Session
+
+from app.database.models import RawReddit, Topic
 
 logger = logging.getLogger("app.ingestion.reddit")
 
 
-class RedditIngestor(BaseIngestor):
-    """Ingests and normalizes community posts from Reddit using Reddit API or OAuth."""
+class RedditIngestor:
+    """Ingests Reddit community discussions into the raw_reddit staging table using PRAW / official API."""
 
     source_name = "reddit"
-    OAUTH_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
-    OAUTH_SEARCH_URL = "https://oauth.reddit.com/search.json"
-    PUBLIC_SEARCH_URL = "https://www.reddit.com/search.json"
 
     def __init__(self):
         self.client_id = os.getenv("REDDIT_CLIENT_ID", "").strip()
         self.client_secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
         self.user_agent = os.getenv(
             "REDDIT_USER_AGENT",
-            "VantageNews/1.0.0 (by /u/vantagenews)",
+            "VantageNews/2.0.0 (by /u/vantagenews)",
         ).strip()
-        self._access_token: Optional[str] = None
 
-    def _get_oauth_token(self, timeout_seconds: float = 5.0) -> Optional[str]:
-        """Obtain application-only OAuth2 bearer token from Reddit API."""
-        if not self.client_id or not self.client_secret:
-            return None
+    def _get_praw_instance(self) -> Optional[praw.Reddit]:
+        """Initialize PRAW instance if credentials are configured."""
+        if self.client_id and self.client_secret:
+            try:
+                return praw.Reddit(
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    user_agent=self.user_agent,
+                )
+            except Exception as e:
+                logger.warning("[reddit] Failed initializing PRAW: %s", str(e))
+        return None
 
-        auth_header = base64.b64encode(
-            f"{self.client_id}:{self.client_secret}".encode("utf-8")
-        ).decode("utf-8")
-
-        data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8")
-        req = urllib.request.Request(
-            self.OAUTH_TOKEN_URL,
-            data=data,
-            headers={
-                "Authorization": f"Basic {auth_header}",
-                "User-Agent": self.user_agent,
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-                return payload.get("access_token")
-        except Exception as e:
-            logger.warning("[reddit] OAuth token request failed, falling back to public endpoint: %s", str(e))
-            return None
-
-    def fetch_items(
+    def fetch_and_stage(
         self,
-        query: str,
-        limit: int = 25,
+        topic: Topic,
+        db: Session,
+        limit: int = 50,
         timeout_seconds: float = 10.0,
-    ) -> List[IngestedItem]:
+    ) -> List[RawReddit]:
+        """Fetch posts for the topic and persist to raw_reddit staging table."""
         logger.info(
-            "Source requested: [reddit] for query '%s' (limit=%d, timeout=%.1fs)",
-            query,
+            "Fetching [reddit] posts for topic '%s' (ID %d, limit=%d, timeout=%.1fs)",
+            topic.title,
+            topic.id,
             limit,
             timeout_seconds,
         )
 
+        reddit = self._get_praw_instance()
+        if reddit:
+            try:
+                staged: List[RawReddit] = []
+                subreddit = reddit.subreddit("all")
+                for post in subreddit.search(query=topic.title, sort="relevance", limit=limit):
+                    title = getattr(post, "title", "") or ""
+                    selftext = getattr(post, "selftext", "") or ""
+                    if selftext in ["[removed]", "[deleted]"]:
+                        selftext = ""
+                    body = f"{title}\n\n{selftext}".strip() if selftext else title
+
+                    if not body:
+                        continue
+
+                    author_name = str(post.author.name) if getattr(post, "author", None) else None
+                    created_utc = (
+                        datetime.utcfromtimestamp(post.created_utc)
+                        if hasattr(post, "created_utc")
+                        else datetime.utcnow()
+                    )
+
+                    record = RawReddit(
+                        slug_id=topic.id,
+                        post_id=str(getattr(post, "id", "")),
+                        body=body,
+                        score=int(getattr(post, "score", 0)),
+                        num_comments=int(getattr(post, "num_comments", 0)),
+                        subreddit=str(getattr(post, "subreddit", "all")),
+                        author=author_name,
+                        created_utc=created_utc,
+                    )
+                    db.add(record)
+                    staged.append(record)
+
+                db.commit()
+                logger.info("[reddit] Staged %d records via PRAW for Topic ID %d", len(staged), topic.id)
+                return staged
+            except Exception as e:
+                logger.error("[reddit] PRAW search error: %s - falling back to REST endpoint", str(e))
+
+        # Fallback to public REST endpoint with custom User-Agent
+        return self._fetch_via_public_rest(topic=topic, db=db, limit=limit, timeout_seconds=timeout_seconds)
+
+    def _fetch_via_public_rest(
+        self,
+        topic: Topic,
+        db: Session,
+        limit: int = 50,
+        timeout_seconds: float = 10.0,
+    ) -> List[RawReddit]:
+        """Fallback public REST API scraper."""
         params = urllib.parse.urlencode({
-            "q": query,
+            "q": topic.title,
             "sort": "relevance",
             "limit": min(limit, 100),
             "raw_json": 1,
         })
+        url = f"https://www.reddit.com/search.json?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
 
-        token = self._get_oauth_token(timeout_seconds=min(5.0, timeout_seconds))
-        if token:
-            url = f"{self.OAUTH_SEARCH_URL}?{params}"
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "User-Agent": self.user_agent,
-            }
-        else:
-            url = f"{self.PUBLIC_SEARCH_URL}?{params}"
-            headers = {
-                "User-Agent": self.user_agent,
-            }
-
-        req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-                raw_json = response.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                logger.error("Source failure: [reddit] rate limited (HTTP 429) for query '%s'", query)
-            else:
-                logger.error("Source failure: [reddit] HTTP %d error for query '%s': %s", e.code, query, str(e))
-            return []
-        except urllib.error.URLError as e:
-            logger.error("Source failure/timeout: [reddit] connection error for '%s': %s", query, str(e))
-            return []
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                raw_json = resp.read().decode("utf-8")
+                return self.parse_json_and_persist(raw_json, topic_id=topic.id, db=db, limit=limit)
         except Exception as e:
-            logger.error("Source failure: [reddit] unexpected error for '%s': %s", query, str(e))
+            logger.error("[reddit] Public REST fallback error for '%s': %s", topic.title, str(e))
             return []
 
-        return self.parse_json_response(raw_json, limit=limit)
-
-    def parse_json_response(self, raw_json: str, limit: int = 25) -> List[IngestedItem]:
-        """Parse Reddit API JSON response and normalize items into IngestedItem."""
+    def parse_json_and_persist(
+        self,
+        raw_json: str,
+        topic_id: int,
+        db: Session,
+        limit: int = 50,
+    ) -> List[RawReddit]:
+        """Parse Reddit search JSON and persist to RawReddit staging table."""
         try:
             data = json.loads(raw_json)
-        except json.JSONDecodeError as e:
-            logger.error("Source failure: [reddit] JSON decode error: %s", str(e))
+        except Exception as e:
+            logger.error("[reddit] JSON parse error: %s", str(e))
             return []
 
         children = data.get("data", {}).get("children", [])
-        logger.info("Number of results received: [reddit] found %d posts", len(children))
+        staged: List[RawReddit] = []
 
-        normalized_items: List[IngestedItem] = []
         for index, child in enumerate(children):
-            if len(normalized_items) >= limit:
+            if len(staged) >= limit:
                 break
             try:
                 post = child.get("data", {})
                 title = (post.get("title") or "").strip()
                 selftext = (post.get("selftext") or "").strip()
-
                 if selftext in ["[removed]", "[deleted]"]:
                     selftext = ""
+                body = f"{title}\n\n{selftext}".strip() if selftext else title
 
-                text_parts = []
-                if title:
-                    text_parts.append(title)
-                if selftext:
-                    text_parts.append(selftext)
-                text_content = "\n\n".join(text_parts).strip()
-
-                if not text_content:
+                if not body:
                     continue
 
-                permalink = post.get("permalink", "")
-                url = f"https://www.reddit.com{permalink}" if permalink else post.get("url")
-                author = post.get("author")
-                author_handle = f"u/{author}" if author else "u/[unknown]"
-
-                created_utc = post.get("created_utc")
-                if created_utc:
-                    created_at = datetime.utcfromtimestamp(created_utc)
-                else:
-                    created_at = datetime.utcnow()
-
-                metrics = {
-                    "score": post.get("score", 0),
-                    "num_comments": post.get("num_comments", 0),
-                    "upvote_ratio": post.get("upvote_ratio", 1.0),
-                    "subreddit": post.get("subreddit"),
-                }
-
-                item = IngestedItem(
-                    source=self.source_name,
-                    text_content=text_content,
-                    url=url,
-                    author_handle=author_handle,
-                    engagement_metrics=metrics,
-                    created_at=created_at,
+                created_utc_ts = post.get("created_utc")
+                created_utc = (
+                    datetime.utcfromtimestamp(created_utc_ts)
+                    if created_utc_ts
+                    else datetime.utcnow()
                 )
-                normalized_items.append(item)
+
+                record = RawReddit(
+                    slug_id=topic_id,
+                    post_id=str(post.get("id") or ""),
+                    body=body,
+                    score=int(post.get("score", 0)),
+                    num_comments=int(post.get("num_comments", 0)),
+                    subreddit=post.get("subreddit"),
+                    author=post.get("author"),
+                    created_utc=created_utc,
+                )
+                db.add(record)
+                staged.append(record)
             except Exception as item_err:
-                logger.warning(
-                    "[reddit] Malformed post entry skipped at index #%d: %s",
-                    index,
-                    str(item_err),
-                )
+                logger.warning("[reddit] Skipping malformed post at #%d: %s", index, str(item_err))
                 continue
 
-        logger.info(
-            "Number successfully normalized: [reddit] %d / %d posts",
-            len(normalized_items),
-            len(children),
-        )
-        return normalized_items
+        db.commit()
+        logger.info("[reddit] Staged %d records for Topic ID %d", len(staged), topic_id)
+        return staged

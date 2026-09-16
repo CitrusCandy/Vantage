@@ -1,5 +1,14 @@
 from app.database.database import Base, SessionLocal, engine, get_db
-from app.database.models import ClusterRun, Perspective, RawData, Topic
+from app.database.models import (
+    ClusterRun,
+    CombinedRawData,
+    Perspective,
+    RawData,
+    RawGoogleNews,
+    RawReddit,
+    RawX,
+    Topic,
+)
 
 __all__ = [
     "Base",
@@ -7,6 +16,10 @@ __all__ = [
     "engine",
     "get_db",
     "Topic",
+    "RawGoogleNews",
+    "RawReddit",
+    "RawX",
+    "CombinedRawData",
     "RawData",
     "Perspective",
     "ClusterRun",

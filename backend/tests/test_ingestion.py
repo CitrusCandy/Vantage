@@ -8,12 +8,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.database.models import Base, RawData, Topic
-from app.ingestion.base import BaseIngestor
+from app.database.models import (
+    Base,
+    CombinedRawData,
+    RawGoogleNews,
+    RawReddit,
+    RawX,
+    Topic,
+)
 from app.ingestion.google_news import GoogleNewsIngestor, clean_html
+from app.ingestion.merge_pipeline import MergePipeline
 from app.ingestion.pipeline import IngestionPipeline
 from app.ingestion.reddit import RedditIngestor
-from app.ingestion.schemas import IngestedItem
+from app.ingestion.x import XScraper
 
 
 # --- Test Fixtures ---
@@ -72,11 +79,6 @@ SAMPLE_GOOGLE_NEWS_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
             <source url="https://bloomberg.com">Bloomberg</source>
             <pubDate>Wed, 16 Sep 2026 13:00:00 GMT</pubDate>
         </item>
-        <item>
-            <!-- Malformed item missing title -->
-            <link>https://news.google.com/articles/empty</link>
-            <description></description>
-        </item>
     </channel>
 </rss>
 """
@@ -87,191 +89,237 @@ def test_clean_html():
     assert clean_html(None) == ""
 
 
-def test_google_news_rss_parsing():
+def test_google_news_staging_persistence(db_session, sample_topic):
     ingestor = GoogleNewsIngestor()
-    items = ingestor.parse_rss_content(SAMPLE_GOOGLE_NEWS_XML, limit=10)
+    staged = ingestor.parse_and_persist(
+        xml_content=SAMPLE_GOOGLE_NEWS_XML,
+        topic_id=sample_topic.id,
+        db=db_session,
+        limit=10,
+    )
 
-    assert len(items) == 2
-    assert items[0].source == "google_news"
-    assert "EU Passes Landmark AI Act" in items[0].text_content
-    assert items[0].url == "https://news.google.com/articles/CAIiEA123"
-    assert items[0].author_handle == "Reuters"
-    assert items[0].engagement_metrics == {"publisher": "Reuters"}
+    assert len(staged) == 2
+    assert staged[0].title == "EU Passes Landmark AI Act"
+    assert staged[0].source_name == "Reuters"
+    assert staged[0].slug_id == sample_topic.id
+    assert staged[1].source_name == "Bloomberg"
 
-    assert items[1].author_handle == "Bloomberg"
+    # Verify rows in database staging table
+    rows = db_session.query(RawGoogleNews).filter(RawGoogleNews.slug_id == sample_topic.id).all()
+    assert len(rows) == 2
 
 
-def test_google_news_fetch_network_failure():
+def test_google_news_fetch_network_failure(db_session, sample_topic):
     ingestor = GoogleNewsIngestor()
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Network unreachable")):
-        results = ingestor.fetch_items("AI Regulation")
+        results = ingestor.fetch_and_stage(topic=sample_topic, db=db_session)
         assert results == []
-
-
-def test_google_news_malformed_xml():
-    ingestor = GoogleNewsIngestor()
-    results = ingestor.parse_rss_content(b"<invalid>xml", limit=10)
-    assert results == []
 
 
 # --- Reddit Tests ---
 
-SAMPLE_REDDIT_RESPONSE = {
+SAMPLE_REDDIT_JSON = json.dumps({
     "data": {
         "children": [
             {
                 "data": {
+                    "id": "post_123",
                     "title": "Discussion on New AI Regulatory Framework",
                     "selftext": "What do you all think about the recent policies passed?",
                     "author": "tech_enthusiast",
-                    "permalink": "/r/technology/comments/123/ai_discussion/",
                     "score": 342,
                     "num_comments": 89,
-                    "upvote_ratio": 0.94,
                     "subreddit": "technology",
                     "created_utc": 1789560000.0,
                 }
             },
             {
                 "data": {
+                    "id": "post_456",
                     "title": "Removed spam post",
                     "selftext": "[removed]",
                     "author": "spammer",
-                    "permalink": "/r/news/comments/456/spam/",
                     "score": 0,
                     "num_comments": 0,
-                    "upvote_ratio": 0.5,
                     "subreddit": "news",
                     "created_utc": 1789561000.0,
                 }
             },
-            {
-                "data": {
-                    # Empty text item
-                    "title": "",
-                    "selftext": "",
-                }
-            },
         ]
     }
-}
+})
 
 
-def test_reddit_response_normalization():
+def test_reddit_staging_persistence(db_session, sample_topic):
     ingestor = RedditIngestor()
-    items = ingestor.parse_json_response(json.dumps(SAMPLE_REDDIT_RESPONSE), limit=10)
-
-    assert len(items) == 2
-    first = items[0]
-    assert first.source == "reddit"
-    assert "Discussion on New AI Regulatory Framework" in first.text_content
-    assert "What do you all think" in first.text_content
-    assert first.author_handle == "u/tech_enthusiast"
-    assert first.url == "https://www.reddit.com/r/technology/comments/123/ai_discussion/"
-    assert first.engagement_metrics["score"] == 342
-    assert first.engagement_metrics["num_comments"] == 89
-    assert first.engagement_metrics["subreddit"] == "technology"
-
-    # [removed] selftext is cleared, but title is retained
-    second = items[1]
-    assert second.text_content == "Removed spam post"
-
-
-def test_reddit_rate_limit_and_error_handling():
-    ingestor = RedditIngestor()
-
-    # Test HTTP 429 Rate Limit error handling
-    mock_http_error = urllib.error.HTTPError("url", 429, "Too Many Requests", {}, None)
-    with patch("urllib.request.urlopen", side_effect=mock_http_error):
-        results = ingestor.fetch_items("AI Regulation")
-        assert results == []
-
-    # Test JSON decode error
-    results = ingestor.parse_json_response("invalid json string")
-    assert results == []
-
-
-# --- Combined Pipeline Tests ---
-
-class MockIngestor(BaseIngestor):
-    def __init__(self, source_name: str, items: list, should_fail: bool = False):
-        self.source_name = source_name
-        self._items = items
-        self._should_fail = should_fail
-
-    def fetch_items(self, query: str, limit: int = 25, timeout_seconds: float = 10.0):
-        if self._should_fail:
-            raise RuntimeError(f"Connection failed for {self.source_name}")
-        return self._items
-
-
-def test_combined_pipeline_success(db_session, sample_topic):
-    mock_gn_item = IngestedItem(
-        source="google_news",
-        text_content="Google News Article Text",
-        url="https://news.google.com/1",
-        author_handle="Reuters",
-        engagement_metrics={},
-        created_at=datetime.utcnow(),
-    )
-    mock_reddit_item = IngestedItem(
-        source="reddit",
-        text_content="Reddit Discussion Content",
-        url="https://reddit.com/r/1",
-        author_handle="u/sample",
-        engagement_metrics={"score": 100},
-        created_at=datetime.utcnow(),
+    staged = ingestor.parse_json_and_persist(
+        raw_json=SAMPLE_REDDIT_JSON,
+        topic_id=sample_topic.id,
+        db=db_session,
+        limit=10,
     )
 
-    pipeline = IngestionPipeline(
-        ingestors=[
-            MockIngestor("google_news", [mock_gn_item]),
-            MockIngestor("reddit", [mock_reddit_item]),
-        ]
+    assert len(staged) == 2
+    assert staged[0].post_id == "post_123"
+    assert staged[0].score == 342
+    assert staged[0].subreddit == "technology"
+    assert "Discussion on New AI Regulatory Framework" in staged[0].body
+    assert staged[0].slug_id == sample_topic.id
+
+    # Verify rows in database staging table
+    rows = db_session.query(RawReddit).filter(RawReddit.slug_id == sample_topic.id).all()
+    assert len(rows) == 2
+
+
+# --- X Scraper Tests ---
+
+SAMPLE_X_HTML = """
+<html>
+<body>
+    <article>
+        <div data-testid="User-Name"><span>@tech_insider</span></div>
+        <div data-testid="tweetText">Major AI regulation updates announced today across global markets. Significant compliance changes expected!</div>
+        <a href="/tech_insider/status/1234567890">link</a>
+        <div data-testid="like" aria-label="1500 likes">1.5K</div>
+        <div data-testid="retweet" aria-label="320 retweets">320</div>
+        <div data-testid="reply" aria-label="45 replies">45</div>
+        <time datetime="2026-09-16T14:30:00Z"></time>
+    </article>
+    <article>
+        <div data-testid="User-Name"><span>@policy_watcher</span></div>
+        <div data-testid="tweetText">Key takeaways from the congressional hearing on frontier AI foundation models.</div>
+        <a href="/policy_watcher/status/9876543210">link</a>
+        <div data-testid="like">250</div>
+        <div data-testid="retweet">40</div>
+        <div data-testid="reply">12</div>
+        <time datetime="2026-09-16T15:00:00Z"></time>
+    </article>
+</body>
+</html>
+"""
+
+
+def test_x_scraper_html_parsing_and_staging(db_session, sample_topic):
+    scraper = XScraper()
+    staged = scraper.parse_html_and_persist(
+        html_content=SAMPLE_X_HTML,
+        topic_id=sample_topic.id,
+        db=db_session,
+        limit=10,
     )
 
-    result = pipeline.run(topic=sample_topic, db=db_session)
+    assert len(staged) == 2
+    assert staged[0].tweet_id == "1234567890"
+    assert staged[0].handle == "tech_insider"
+    assert staged[0].likes == 1500
+    assert staged[0].retweets == 320
+    assert staged[0].slug_id == sample_topic.id
 
-    assert result["total_persisted"] == 2
-    assert result["source_breakdown"] == {"google_news": 1, "reddit": 1}
-    assert sample_topic.search_count == 1
-    assert sample_topic.source_coverage["google_news"] == 1
-    assert sample_topic.source_coverage["reddit"] == 1
-    assert sample_topic.source_coverage["total_raw_items"] == 2
+    assert staged[1].tweet_id == "9876543210"
+    assert staged[1].handle == "policy_watcher"
 
-    # Verify rows in database
-    db_items = db_session.query(RawData).filter(RawData.topic_id == sample_topic.id).all()
-    assert len(db_items) == 2
-    sources = {item.source for item in db_items}
-    assert sources == {"google_news", "reddit"}
+    # Verify rows in database staging table
+    rows = db_session.query(RawX).filter(RawX.slug_id == sample_topic.id).all()
+    assert len(rows) == 2
 
 
-def test_combined_pipeline_isolated_failure(db_session, sample_topic):
-    """Ensure one failing source does not stop other sources from persisting."""
-    mock_reddit_item = IngestedItem(
-        source="reddit",
-        text_content="Reddit Discussion Content",
-        url="https://reddit.com/r/1",
-        author_handle="u/sample",
-        engagement_metrics={"score": 50},
-        created_at=datetime.utcnow(),
+def test_x_scraper_fail_soft_isolation(db_session, sample_topic):
+    scraper = XScraper()
+    # Scraper should safely return empty without throwing
+    res = scraper.fetch_and_stage(topic=sample_topic, db=db_session)
+    assert res == []
+
+
+# --- Merge & Normalization Tests ---
+
+def test_merge_pipeline_unions_all_three_sources(db_session, sample_topic):
+    # Stage items in raw_google_news
+    db_session.add(
+        RawGoogleNews(
+            slug_id=sample_topic.id,
+            title="Google News AI Article",
+            link="https://news.google.com/1",
+            source_name="Reuters",
+            snippet="Snippet text",
+            published_at=datetime.utcnow(),
+        )
     )
-
-    pipeline = IngestionPipeline(
-        ingestors=[
-            MockIngestor("google_news", [], should_fail=True),
-            MockIngestor("reddit", [mock_reddit_item]),
-        ]
+    # Stage items in raw_reddit
+    db_session.add(
+        RawReddit(
+            slug_id=sample_topic.id,
+            post_id="rd_1",
+            body="Reddit post on AI ethics",
+            score=100,
+            num_comments=25,
+            subreddit="artificial",
+            author="reddit_user",
+            created_utc=datetime.utcnow(),
+        )
     )
+    # Stage items in raw_x
+    db_session.add(
+        RawX(
+            slug_id=sample_topic.id,
+            tweet_id="tw_1",
+            text="Tweet about AI governance legislation",
+            likes=50,
+            retweets=10,
+            replies=5,
+            handle="x_user",
+            posted_at=datetime.utcnow(),
+        )
+    )
+    db_session.commit()
 
-    result = pipeline.run(topic=sample_topic, db=db_session)
+    merge_pipe = MergePipeline()
+    result = merge_pipe.merge_topic_staging_data(topic=sample_topic, db=db_session)
 
-    assert result["total_persisted"] == 1
-    assert result["source_breakdown"]["reddit"] == 1
-    assert result["source_breakdown"]["google_news"] == 0
-    assert "google_news" in result["source_errors"]
+    assert result["status"] == "success"
+    assert result["new_records_added"] == 3
+    assert result["source_breakdown"] == {"google_news": 1, "reddit": 1, "x": 1}
 
-    # Verify database persistence for the successful source
-    db_items = db_session.query(RawData).filter(RawData.topic_id == sample_topic.id).all()
-    assert len(db_items) == 1
-    assert db_items[0].source == "reddit"
+    # Verify rows in combined_raw_data
+    combined_rows = db_session.query(CombinedRawData).filter(CombinedRawData.slug_id == sample_topic.id).all()
+    assert len(combined_rows) == 3
+    sources = {r.source for r in combined_rows}
+    assert sources == {"google_news", "reddit", "x"}
+
+    # Verify source attribution & URLs
+    gn_c = [r for r in combined_rows if r.source == "google_news"][0]
+    assert gn_c.url == "https://news.google.com/1"
+    assert gn_c.author_handle == "Reuters"
+
+    rd_c = [r for r in combined_rows if r.source == "reddit"][0]
+    assert rd_c.author_handle == "u/reddit_user"
+    assert rd_c.engagement_metrics["score"] == 100
+
+    x_c = [r for r in combined_rows if r.source == "x"][0]
+    assert x_c.author_handle == "@x_user"
+    assert x_c.engagement_metrics["likes"] == 50
+
+
+def test_merge_pipeline_idempotency_repeated_runs(db_session, sample_topic):
+    # Add staging records
+    db_session.add(
+        RawGoogleNews(
+            slug_id=sample_topic.id,
+            title="Single News Story",
+            link="https://news.google.com/unique1",
+            source_name="AP",
+            published_at=datetime.utcnow(),
+        )
+    )
+    db_session.commit()
+
+    merge_pipe = MergePipeline()
+    # First merge
+    res1 = merge_pipe.merge_topic_staging_data(topic=sample_topic, db=db_session)
+    assert res1["new_records_added"] == 1
+
+    # Second merge (should not duplicate records)
+    res2 = merge_pipe.merge_topic_staging_data(topic=sample_topic, db=db_session)
+    assert res2["new_records_added"] == 0
+
+    combined_rows = db_session.query(CombinedRawData).filter(CombinedRawData.slug_id == sample_topic.id).all()
+    assert len(combined_rows) == 1

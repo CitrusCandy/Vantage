@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database.database import get_db
-from app.database.models import Base, ClusterRun, RawData, Topic
+from app.database.models import Base, ClusterRun, CombinedRawData, Topic
 from app.main import app
 from app.processing.cluster_pipeline import ClusterPipeline
 from app.processing.clustering import ClusterResult, HDBSCANClusterer
@@ -71,11 +71,10 @@ def test_mock_embedding_provider():
 
     assert len(embeddings) == 3
     assert len(embeddings[0]) == 32
-    # Verify L2 normalization: norm should be approximately 1.0
+    # Verify L2 normalization
     norm = np.linalg.norm(embeddings[0])
     assert abs(norm - 1.0) < 1e-4
 
-    # Single text embedding helper
     single = provider.embed_single("Test sentence")
     assert len(single) == 32
 
@@ -111,7 +110,6 @@ def test_openai_embedding_missing_api_key():
 def test_openai_embedding_api_failure_handling():
     provider = OpenAIEmbeddingProvider(api_key="test_key_sk_123")
 
-    # Simulate HTTP 401 Unauthorized
     mock_http_err = urllib.error.HTTPError(
         "url", 401, "Unauthorized", {}, MagicMock(read=lambda: b'{"error": "Invalid API key"}')
     )
@@ -119,7 +117,6 @@ def test_openai_embedding_api_failure_handling():
         with pytest.raises(RuntimeError, match="OpenAI Embedding API error HTTP 401"):
             provider.embed_texts(["Some text"])
 
-    # Simulate Network Timeout
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Connection timed out")):
         with pytest.raises(RuntimeError, match="OpenAI Embedding connection failed"):
             provider.embed_texts(["Some text"])
@@ -130,7 +127,6 @@ def test_openai_embedding_api_failure_handling():
 def test_hdbscan_clustering_groups_and_noise():
     clusterer = HDBSCANClusterer(min_cluster_size=3, n_representative_samples=2)
 
-    # 3 distinct dense vector groups + 1 outlier
     group_a = [[1.0, 0.0, 0.0] + [0.0] * 5 for _ in range(4)]
     group_b = [[0.0, 1.0, 0.0] + [0.0] * 5 for _ in range(4)]
     outlier = [[0.0, 0.0, 1.0] + [0.0] * 5]
@@ -143,7 +139,6 @@ def test_hdbscan_clustering_groups_and_noise():
     assert len(res.labels) == 9
     assert len(res.probabilities) == 9
 
-    # Check representative sample indices exist for valid clusters
     for cid in res.cluster_sizes.keys():
         assert cid in res.representative_indices
         assert len(res.representative_indices[cid]) <= 2
@@ -162,16 +157,16 @@ def test_hdbscan_empty_input():
 def test_cluster_pipeline_insufficient_volume(db_session, sample_topic):
     # Insert 2 distinct raw items when threshold is 30
     db_session.add(
-        RawData(
-            topic_id=sample_topic.id,
+        CombinedRawData(
+            slug_id=sample_topic.id,
             source="reddit",
             text_content="First distinct discussion focusing on tokamak plasma confinement physics.",
             author_handle="u/physicist_one",
         )
     )
     db_session.add(
-        RawData(
-            topic_id=sample_topic.id,
+        CombinedRawData(
+            slug_id=sample_topic.id,
             source="google_news",
             text_content="Second distinct report detailing stellarator coil manufacturing advancements.",
             author_handle="Science Journal",
@@ -191,13 +186,11 @@ def test_cluster_pipeline_insufficient_volume(db_session, sample_topic):
     assert result["min_volume_threshold"] == 30
     assert result["cluster_count"] == 0
 
-    # Ensure no ClusterRun was persisted
     runs = db_session.query(ClusterRun).filter(ClusterRun.topic_id == sample_topic.id).all()
     assert len(runs) == 0
 
 
 def test_cluster_pipeline_success_and_persistence(db_session, sample_topic):
-    # Distinct items across 2 perspective angles
     distinct_contents = [
         "First analysis on high temperature superconducting magnets reducing reactor footprint.",
         "Second review regarding Commonwealth Fusion Systems SPARC tokamak construction timeline.",
@@ -209,8 +202,8 @@ def test_cluster_pipeline_success_and_persistence(db_session, sample_topic):
 
     for i, content in enumerate(distinct_contents):
         db_session.add(
-            RawData(
-                topic_id=sample_topic.id,
+            CombinedRawData(
+                slug_id=sample_topic.id,
                 source="reddit" if i % 2 == 0 else "google_news",
                 text_content=content,
                 author_handle=f"u/author_{i}",
@@ -236,7 +229,6 @@ def test_cluster_pipeline_success_and_persistence(db_session, sample_topic):
     assert "cluster_run_id" in result
     assert len(result["clusters"]) >= 1
 
-    # Verify ClusterRun database record
     run_record = db_session.query(ClusterRun).filter(ClusterRun.run_id == result["cluster_run_id"]).first()
     assert run_record is not None
     assert run_record.topic_id == sample_topic.id
@@ -244,7 +236,6 @@ def test_cluster_pipeline_success_and_persistence(db_session, sample_topic):
     assert run_record.sample_size == 6
     assert run_record.cluster_count == result["cluster_count"]
 
-    # Verify Topic last_clustered_at was updated
     assert sample_topic.last_clustered_at is not None
 
 
@@ -259,8 +250,8 @@ def test_api_cluster_topic_endpoint(db_session, sample_topic):
     ]
     for i, text in enumerate(contents):
         db_session.add(
-            RawData(
-                topic_id=sample_topic.id,
+            CombinedRawData(
+                slug_id=sample_topic.id,
                 source="google_news",
                 text_content=text,
                 author_handle=f"Publication {i}",

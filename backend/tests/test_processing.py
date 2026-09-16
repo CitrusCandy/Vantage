@@ -4,7 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.database.models import Base, RawData, Topic
+from app.database.models import Base, CombinedRawData, Topic
 from app.processing.bot_detector import BotDetector
 from app.processing.minhash_lsh import MinHash, MinHashLSH
 from app.processing.processor import DiscourseProcessor
@@ -90,8 +90,8 @@ def test_minhash_jaccard_estimation():
     sim_1_2 = m1.jaccard(m2)
     sim_1_3 = m1.jaccard(m3)
 
-    assert sim_1_2 >= 0.70, f"Expected high similarity between near duplicates, got {sim_1_2}"
-    assert sim_1_3 <= 0.15, f"Expected low similarity for unrelated text, got {sim_1_3}"
+    assert sim_1_2 >= 0.70
+    assert sim_1_3 <= 0.15
 
 
 def test_minhash_lsh_duplicate_detection():
@@ -108,7 +108,6 @@ def test_minhash_lsh_duplicate_detection():
     lsh.insert("doc_a", m_a)
     lsh.insert("doc_c", m_c)
 
-    # Querying with near-duplicate doc_b should match doc_a
     matches_b = lsh.query(m_b)
     assert "doc_a" in matches_b
     assert "doc_c" not in matches_b
@@ -120,8 +119,8 @@ def test_bot_detector():
     detector = BotDetector(min_char_length=20, min_word_count=4)
 
     # Legitimate news/opinion
-    valid_item = RawData(
-        topic_id=1,
+    valid_item = CombinedRawData(
+        slug_id=1,
         source="reddit",
         text_content="The new policy will significantly affect domestic semiconductor fabrication timeline over the next five years.",
         author_handle="u/tech_analyst",
@@ -130,8 +129,8 @@ def test_bot_detector():
     assert not res_valid.is_bot
 
     # Spam keyword trigger
-    spam_item = RawData(
-        topic_id=1,
+    spam_item = CombinedRawData(
+        slug_id=1,
         source="reddit",
         text_content="Join our telegram group for free crypto airdrop signals and 100x gem alerts today!",
         author_handle="u/crypto_promoter",
@@ -141,8 +140,8 @@ def test_bot_detector():
     assert any("Spam keyword" in r for r in res_spam.reasons)
 
     # Bot author handle
-    bot_author_item = RawData(
-        topic_id=1,
+    bot_author_item = CombinedRawData(
+        slug_id=1,
         source="reddit",
         text_content="Daily discussion thread for tech news and market updates across global stock indices.",
         author_handle="u/AutoModerator",
@@ -152,8 +151,8 @@ def test_bot_detector():
     assert any("Bot author" in r for r in res_bot.reasons)
 
     # Excessive link spam
-    link_spam_item = RawData(
-        topic_id=1,
+    link_spam_item = CombinedRawData(
+        slug_id=1,
         source="reddit",
         text_content="Check this out: https://spam1.com/deal https://spam2.com/promo https://spam3.com/ref",
         author_handle="u/link_sharer",
@@ -162,8 +161,8 @@ def test_bot_detector():
     assert res_link.is_bot
 
     # Too short
-    short_item = RawData(
-        topic_id=1,
+    short_item = CombinedRawData(
+        slug_id=1,
         source="reddit",
         text_content="Too short.",
         author_handle="u/user123",
@@ -172,55 +171,55 @@ def test_bot_detector():
     assert res_short.is_bot
 
 
-# --- End-to-End Processing & Deduplication Pipeline Tests ---
+# --- Cross-Source Deduplication & Volume Gate Tests ---
 
-def test_processing_pipeline_deduplication_and_bot_flagging(db_session, sample_topic):
-    # Insert 6 raw items:
+def test_cross_source_deduplication_and_bot_flagging(db_session, sample_topic):
+    # Cross-source items:
     # 1. Google News article A
-    # 2. Reddit post duplicate of Article A (exact duplicate)
-    # 3. Reddit post near-duplicate of Article A (near duplicate)
+    # 2. Reddit post duplicate of Article A (exact duplicate across sources)
+    # 3. X tweet near-duplicate of Article A (near duplicate across sources)
     # 4. Google News article B (unique)
-    # 5. Reddit post C (unique)
-    # 6. Bot spam post (should be flagged)
+    # 5. X tweet C (unique)
+    # 6. Bot spam post on Reddit (flagged)
 
     items = [
-        RawData(
-            topic_id=sample_topic.id,
+        CombinedRawData(
+            slug_id=sample_topic.id,
             source="google_news",
             text_content="TSMC announces thirty billion investment in cutting-edge semiconductor fabrication facilities worldwide.",
             author_handle="Reuters",
             url="https://news.google.com/1",
         ),
-        RawData(
-            topic_id=sample_topic.id,
+        CombinedRawData(
+            slug_id=sample_topic.id,
             source="reddit",
             text_content="TSMC announces thirty billion investment in cutting-edge semiconductor fabrication facilities worldwide.",
             author_handle="u/user1",
             url="https://reddit.com/r/1",
         ),
-        RawData(
-            topic_id=sample_topic.id,
-            source="reddit",
+        CombinedRawData(
+            slug_id=sample_topic.id,
+            source="x",
             text_content="TSMC announced a thirty billion investment in cutting-edge semiconductor fabrication facilities worldwide!",
-            author_handle="u/user2",
-            url="https://reddit.com/r/2",
+            author_handle="@user2",
+            url="https://x.com/user2/1",
         ),
-        RawData(
-            topic_id=sample_topic.id,
+        CombinedRawData(
+            slug_id=sample_topic.id,
             source="google_news",
             text_content="Intel reveals latest generation microprocessors with advanced neural processing units for laptop computing.",
             author_handle="Bloomberg",
             url="https://news.google.com/2",
         ),
-        RawData(
-            topic_id=sample_topic.id,
-            source="reddit",
+        CombinedRawData(
+            slug_id=sample_topic.id,
+            source="x",
             text_content="Engineers debate the cooling efficiency and thermal architecture of high performance GPU clusters.",
-            author_handle="u/hardware_geek",
-            url="https://reddit.com/r/3",
+            author_handle="@hardware_geek",
+            url="https://x.com/hardware_geek/1",
         ),
-        RawData(
-            topic_id=sample_topic.id,
+        CombinedRawData(
+            slug_id=sample_topic.id,
             source="reddit",
             text_content="Free crypto airdrop presale live now join telegram for discount promo codes!",
             author_handle="u/crypto_bot",
@@ -242,27 +241,26 @@ def test_processing_pipeline_deduplication_and_bot_flagging(db_session, sample_t
     assert stats.usable_items_count == 3
     assert stats.volume_gate_passed is True
 
-    # Check that bot item was flagged in DB but NOT deleted
-    all_db_items = db_session.query(RawData).filter(RawData.topic_id == sample_topic.id).all()
-    assert len(all_db_items) == 6  # All 6 records preserved
+    # Check that bot item was flagged in DB without deleting records
+    all_db_items = db_session.query(CombinedRawData).filter(CombinedRawData.slug_id == sample_topic.id).all()
+    assert len(all_db_items) == 6
     flagged = [it for it in all_db_items if it.is_flagged_bot]
     assert len(flagged) == 1
     assert flagged[0].author_handle == "u/crypto_bot"
 
 
 def test_minimum_volume_gate(db_session, sample_topic):
-    # Two distinct discussion posts with a threshold of 30
     db_session.add(
-        RawData(
-            topic_id=sample_topic.id,
+        CombinedRawData(
+            slug_id=sample_topic.id,
             source="reddit",
             text_content="First comprehensive analysis on international port congestion and shipping logistics across Asia.",
             author_handle="u/analyst_one",
         )
     )
     db_session.add(
-        RawData(
-            topic_id=sample_topic.id,
+        CombinedRawData(
+            slug_id=sample_topic.id,
             source="google_news",
             text_content="Second detailed report on raw silicon supply constraints impacting European automotive manufacturing.",
             author_handle="Financial Times",

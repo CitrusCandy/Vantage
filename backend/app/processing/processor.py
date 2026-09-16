@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.database.models import RawData, Topic
+from app.database.models import CombinedRawData, Topic
 from app.processing.bot_detector import BotDetector
 from app.processing.minhash_lsh import MinHash, MinHashLSH
 from app.processing.text_cleaner import (
@@ -37,7 +37,7 @@ class ProcessingResult:
 
     topic_id: int
     statistics: ProcessingStatistics
-    usable_items: List[RawData]
+    usable_items: List[CombinedRawData]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -48,7 +48,7 @@ class ProcessingResult:
 
 
 class DiscourseProcessor:
-    """Orchestrates discourse normalization, bot heuristics, MinHash/LSH deduplication, and volume gating."""
+    """Orchestrates cross-source discourse normalization, bot heuristics, MinHash/LSH deduplication, and volume gating."""
 
     def __init__(
         self,
@@ -70,22 +70,22 @@ class DiscourseProcessor:
         db: Session,
         min_volume_override: Optional[int] = None,
     ) -> ProcessingResult:
-        """Process, filter, and deduplicate all raw discourse items for a given topic."""
+        """Process, filter, and deduplicate all raw discourse items for a given topic from combined_raw_data."""
         threshold = (
             min_volume_override
             if min_volume_override is not None
             else self.min_volume_threshold
         )
 
-        raw_items: List[RawData] = (
-            db.query(RawData)
-            .filter(RawData.topic_id == topic.id)
-            .order_by(RawData.created_at.asc())
+        raw_items: List[CombinedRawData] = (
+            db.query(CombinedRawData)
+            .filter(CombinedRawData.slug_id == topic.id)
+            .order_by(CombinedRawData.created_at.asc())
             .all()
         )
 
         logger.info(
-            "Processing started: Topic ID %d ('%s') with %d raw items",
+            "Processing started: Topic ID %d ('%s') with %d combined items",
             topic.id,
             topic.title,
             len(raw_items),
@@ -97,14 +97,14 @@ class DiscourseProcessor:
         )
 
         # Step 1: Apply bot/spam heuristics & flag in DB without deletion
-        non_bot_items: List[RawData] = []
+        non_bot_items: List[CombinedRawData] = []
         for item in raw_items:
             bot_result = self.bot_detector.evaluate(item)
             if bot_result.is_bot:
                 item.is_flagged_bot = True
                 stats.bot_flagged_count += 1
                 logger.debug(
-                    "RawData #%d flagged as bot/spam: %s",
+                    "CombinedRawData #%d flagged as bot/spam: %s",
                     item.raw_id,
                     ", ".join(bot_result.reasons),
                 )
@@ -112,14 +112,14 @@ class DiscourseProcessor:
                 item.is_flagged_bot = False
                 non_bot_items.append(item)
 
-        # Step 2: Exact and Near-Duplicate Deduplication
+        # Step 2: Cross-Source Exact and Near-Duplicate Deduplication (MinHash + LSH)
         seen_exact_hashes: Set[str] = set()
         lsh_index = MinHashLSH(
             threshold=self.jaccard_threshold,
             num_perm=self.num_perm,
         )
 
-        usable_items: List[RawData] = []
+        usable_items: List[CombinedRawData] = []
         source_counts: Dict[str, int] = {}
 
         for item in non_bot_items:
@@ -127,14 +127,14 @@ class DiscourseProcessor:
             if not norm_text:
                 continue
 
-            # Check exact duplicate via SHA-256
+            # Check exact duplicate via SHA-256 across all sources
             exact_hash = hashlib.sha256(norm_text.encode("utf-8")).hexdigest()
             if exact_hash in seen_exact_hashes:
                 stats.exact_duplicates_removed += 1
                 continue
             seen_exact_hashes.add(exact_hash)
 
-            # Check near-duplicate via MinHash + LSH
+            # Check near-duplicate via MinHash + LSH across sources
             shingles = extract_shingles(norm_text, k=self.shingle_k)
             minhash = MinHash(num_perm=self.num_perm)
             minhash.update(shingles)
@@ -143,7 +143,7 @@ class DiscourseProcessor:
             if near_matches:
                 stats.near_duplicates_removed += 1
                 logger.debug(
-                    "RawData #%d detected as near-duplicate of %s",
+                    "CombinedRawData #%d detected as near-duplicate of %s",
                     item.raw_id,
                     near_matches,
                 )

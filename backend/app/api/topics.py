@@ -15,6 +15,8 @@ from app.database.schemas import (
     TopicResponse,
     TopicUpdate,
 )
+from app.ingestion.merge_pipeline import MergePipeline
+from app.ingestion.pipeline import IngestionPipeline
 from app.processing.cluster_pipeline import ClusterPipeline
 
 router = APIRouter(prefix="/topics", tags=["Topics"])
@@ -57,8 +59,10 @@ def create_topic(
     unique_slug = get_unique_slug(db, raw_slug)
 
     initial_coverage = topic_in.source_coverage or {
-        "reddit": 0,
         "google_news": 0,
+        "reddit": 0,
+        "x": 0,
+        "total_combined": 0,
     }
 
     topic = Topic(
@@ -158,7 +162,7 @@ def delete_topic(
     slug: str,
     db: Session = Depends(get_db),
 ):
-    """Safely delete a topic and its associated child records (perspectives, raw data, cluster runs)."""
+    """Safely delete a topic and its associated child records."""
     topic = db.query(Topic).filter(Topic.slug == slug).first()
     if not topic:
         raise HTTPException(
@@ -169,6 +173,49 @@ def delete_topic(
     db.delete(topic)
     db.commit()
     return {"message": f"Topic '{slug}' and its associated records have been deleted successfully"}
+
+
+@router.post(
+    "/{slug}/ingest",
+    status_code=status.HTTP_200_OK,
+    summary="Trigger multi-source ingestion into staging tables and merge",
+)
+def ingest_topic(
+    slug: str,
+    limit_per_source: int = Query(default=50, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Trigger independent scrapers (Google News, Reddit, X) into staging tables followed by merge."""
+    topic = db.query(Topic).filter(Topic.slug == slug).first()
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Topic with slug '{slug}' not found",
+        )
+
+    pipeline = IngestionPipeline()
+    return pipeline.run(topic=topic, db=db, limit_per_source=limit_per_source)
+
+
+@router.post(
+    "/{slug}/merge",
+    status_code=status.HTTP_200_OK,
+    summary="Merge staging tables into combined_raw_data",
+)
+def merge_topic_staging(
+    slug: str,
+    db: Session = Depends(get_db),
+):
+    """Execute merge/normalization from raw_google_news, raw_reddit, raw_x into combined_raw_data."""
+    topic = db.query(Topic).filter(Topic.slug == slug).first()
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Topic with slug '{slug}' not found",
+        )
+
+    pipeline = MergePipeline()
+    return pipeline.merge_topic_staging_data(topic=topic, db=db)
 
 
 @router.post(
@@ -185,7 +232,7 @@ def cluster_topic(
     ),
     db: Session = Depends(get_db),
 ):
-    """Run preprocessing, embeddings generation, HDBSCAN clustering, and persist ClusterRun."""
+    """Run preprocessing, embeddings generation, HDBSCAN clustering on combined dataset."""
     topic = db.query(Topic).filter(Topic.slug == slug).first()
     if not topic:
         raise HTTPException(
