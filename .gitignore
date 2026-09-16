@@ -52,3 +52,14 @@ Thumbs.db
 *.log
 *.sqlite
 *.sqlite3
+
+# Node.js & Next.js
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+next-env.d.ts
+
