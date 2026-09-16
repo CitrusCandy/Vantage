@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.core.security import sanitize_url
 from app.database.models import (
     CombinedRawData,
     RawGoogleNews,
@@ -61,7 +62,7 @@ class MergePipeline:
                 slug_id=topic.id,
                 source="google_news",
                 text_content=full_text,
-                url=gn.link,
+                url=sanitize_url(gn.link),
                 author_handle=gn.source_name,
                 engagement_metrics={"source_name": gn.source_name} if gn.source_name else {},
                 is_flagged_bot=False,
@@ -79,7 +80,7 @@ class MergePipeline:
             .all()
         )
         for rd in reddit_records:
-            url = f"https://www.reddit.com/comments/{rd.post_id}" if rd.post_id else None
+            url = sanitize_url(f"https://www.reddit.com/comments/{rd.post_id}") if rd.post_id else None
             fp = ("reddit", url or rd.body[:100])
 
             if fp in existing_fingerprints:
@@ -111,7 +112,8 @@ class MergePipeline:
             .all()
         )
         for x in x_records:
-            url = f"https://x.com/{x.handle}/status/{x.tweet_id}" if x.handle and x.tweet_id else None
+            raw_x_url = f"https://x.com/{x.handle}/status/{x.tweet_id}" if x.handle and x.tweet_id else None
+            url = sanitize_url(raw_x_url)
             fp = ("x", url or x.text[:100])
 
             if fp in existing_fingerprints:

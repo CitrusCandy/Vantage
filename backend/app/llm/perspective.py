@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import urllib.error
 import urllib.request
 
+from app.core.security import sanitize_url
 from app.llm.schemas import (
     PerspectiveItem,
     PerspectiveSynthesisOutput,
@@ -117,7 +118,12 @@ Instructions:
                 resp_data = json.loads(resp.read().decode("utf-8"))
                 choice = resp_data["choices"][0]["message"]["content"]
                 parsed_json = json.loads(choice)
-                return PerspectiveSynthesisOutput.model_validate(parsed_json)
+                raw_output = PerspectiveSynthesisOutput.model_validate(parsed_json)
+                # Sanitize all quote URLs for security
+                for p in raw_output.perspectives:
+                    for q in p.sample_quotes:
+                        q.url = sanitize_url(q.url)
+                return raw_output
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
             logger.error("OpenAI Chat Completion error HTTP %d: %s", e.code, err_body)
@@ -195,7 +201,7 @@ class MockPerspectiveSynthesizer(BasePerspectiveSynthesizer):
                     SampleQuote(
                         text=s.get("text_content", "")[:120] + "...",
                         source=s.get("source", "google_news"),
-                        url=s.get("url"),
+                        url=sanitize_url(s.get("url")),
                     )
                     for s in samples[:2]
                 ]

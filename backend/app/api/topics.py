@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.core.security import sanitize_search_query, validate_slug
 from app.database.database import get_db
 from app.database.models import Topic
 from app.database.schemas import (
@@ -96,13 +97,15 @@ def list_topics(
     """Retrieve topics ordered by updated_at descending with optional search filtering."""
     query = db.query(Topic)
     if search:
-        search_term = f"%{search.strip()}%"
-        query = query.filter(
-            or_(
-                Topic.title.ilike(search_term),
-                Topic.slug.ilike(search_term),
+        clean_search = sanitize_search_query(search)
+        if clean_search:
+            search_term = f"%{clean_search}%"
+            query = query.filter(
+                or_(
+                    Topic.title.ilike(search_term, escape="\\"),
+                    Topic.slug.ilike(search_term, escape="\\"),
+                )
             )
-        )
     return query.order_by(Topic.updated_at.desc()).all()
 
 

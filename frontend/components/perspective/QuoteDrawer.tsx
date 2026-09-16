@@ -3,7 +3,7 @@ import { ExternalLink, MessageSquare, ThumbsUp, Repeat, MessageCircle, User, Cal
 import { SampleQuote } from "@/lib/types";
 import { Modal } from "../common/Modal";
 import { SourceBadge } from "../source/SourceBadge";
-import { formatDate } from "@/lib/utils";
+import { formatDate, isSafeExternalUrl } from "@/lib/utils";
 
 interface QuoteDrawerProps {
   quote: SampleQuote | null;
@@ -108,7 +108,7 @@ export const QuoteDrawer: React.FC<QuoteDrawerProps> = ({
         )}
 
         {/* Direct Link */}
-        {quote.url && (
+        {quote.url && isSafeExternalUrl(quote.url) && (
           <div className="pt-2 flex justify-end">
             <a
               href={quote.url}

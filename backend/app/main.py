@@ -21,12 +21,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Enable CORS for frontend client communication
+from app.core.security import get_allowed_cors_origins
+
+# Enable secure CORS for frontend client communication
+allowed_origins = get_allowed_cors_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=allowed_origins,
+    allow_credentials=True if "*" not in allowed_origins else False,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -43,6 +46,9 @@ async def add_process_time_and_log_middleware(request: Request, call_next):
     response = await call_next(request)
     duration_ms = (time.perf_counter() - start_time) * 1000.0
     response.headers["X-Process-Time"] = f"{duration_ms:.2f}ms"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     logger.info(
         "[HTTP] %s %s -> %d (%.2f ms)",
         request.method,

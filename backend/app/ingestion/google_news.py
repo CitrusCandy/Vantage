@@ -10,6 +10,7 @@ from typing import List, Optional
 import feedparser
 from sqlalchemy.orm import Session
 
+from app.core.security import sanitize_url
 from app.database.models import RawGoogleNews, Topic
 
 logger = logging.getLogger("app.ingestion.google_news")
@@ -85,7 +86,7 @@ class GoogleNewsIngestor:
                 break
             try:
                 title = clean_html(getattr(entry, "title", ""))
-                link = getattr(entry, "link", None)
+                link = sanitize_url(getattr(entry, "link", None))
                 snippet = clean_html(getattr(entry, "summary", "") or getattr(entry, "description", ""))
 
                 # Extract source outlet name
