@@ -67,6 +67,20 @@ app.include_router(ops_router, prefix="/api")
 
 @app.get("/health")
 def health_check():
+    """Liveness probe: verifies process is alive."""
     return {"status": "healthy"}
+
+
+@app.get("/ready")
+def readiness_check():
+    """Readiness probe: verifies database connectivity and core services."""
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "ready", "database": "connected"}
+    except Exception as e:
+        return {"status": "unready", "database": "disconnected", "detail": str(e)}, 503
+
 
 

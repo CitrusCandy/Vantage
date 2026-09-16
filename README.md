@@ -165,12 +165,33 @@ Services will be accessible at:
 
 ---
 
-## API Highlights
+## API & Operations Highlights
 
 - `GET /api/topics/trending` — Top viral topics ranked via multi-source velocity, reach, and time decay.
 - `POST /api/topics` — Create topic query.
 - `GET /api/topics/{slug}` — Retrieve topic and its synthesized perspectives.
 - `POST /api/topics/{slug}/run-pipeline` — Execute full end-to-end flow: Ingestion $\rightarrow$ Staging $\rightarrow$ Merge $\rightarrow$ HDBSCAN Clustering $\rightarrow$ LLM Synthesis.
+- `GET /api/ops/overview` — High-level operational health and system overview.
+- `GET /api/ops/pipeline-metrics` — Multi-stage pipeline latency telemetry, median durations, and slowest stages.
+- `GET /api/ops/source-health` — Fault-isolated reliability status for Google News, Reddit, X, and OpenAI.
 - `GET /api/workers/status` — Inspect background scheduler status.
 - `POST /api/workers/refresh-trending` — Trigger background topic refresh cycle.
+
+---
+
+## Automated Quality Gates & Local Release Verification
+
+Before pushing changes or deploying to production, execute the automated release verification gate:
+
+```bash
+# 1. Run release verification gate (checks files, env templates, secret scan, imports, probes)
+python scripts/verify_release.py
+
+# 2. Run complete backend test suite (100% offline, deterministic)
+pytest backend/tests/ -v
+
+# 3. Verify frontend production compilation
+cd frontend && npm run build
+```
+
 
