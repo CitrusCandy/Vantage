@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core import resource_governor
 from app.core.telemetry import PipelineTimingTracker
 from app.database.models import ClusterRun, RawData, Topic
 from app.processing.clustering import ClusterResult, HDBSCANClusterer
@@ -78,12 +79,30 @@ class ClusterPipeline:
                 "timings": tracker.get_summary(),
             }
 
-        # 3. Extract text content
+        # 3. Extract text content, clamping to budget
+        max_processing = resource_governor.budget_manager.get_limit("max_processing_items")
+        if len(usable_items) > max_processing:
+            logger.warning(
+                "Clamping usable items from %d to budget limit %d for topic ID %d",
+                len(usable_items), max_processing, topic.id,
+            )
+            usable_items = usable_items[:max_processing]
+
+        max_embeddings = resource_governor.budget_manager.get_limit("max_embeddings_per_run")
+        if len(usable_items) > max_embeddings:
+            logger.warning(
+                "Clamping items to embedding budget limit %d for topic ID %d",
+                max_embeddings, topic.id,
+            )
+            usable_items = usable_items[:max_embeddings]
+
         texts = [item.text_content for item in usable_items]
 
         # 4. Generate Embeddings
         with tracker.track("embedding_generation", text_count=len(texts), provider=self.embedding_provider.model_name):
             embeddings = self.embedding_provider.embed_texts(texts)
+            resource_governor.cost_tracker.record_embedding_call(item_count=len(texts))
+            resource_governor.cost_tracker.record_items_processed(len(texts))
 
         # 5. Execute HDBSCAN Clustering
         with tracker.track("hdbscan_clustering", sample_count=len(usable_items)):

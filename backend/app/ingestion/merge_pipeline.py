@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.core import resource_governor
 from app.core.security import sanitize_url
 from app.database.models import (
     CombinedRawData,
@@ -54,7 +55,6 @@ class MergePipeline:
                 text_parts.append(gn.snippet)
             full_text = "\n\n".join(text_parts).strip()
             fp = ("google_news", gn.link or full_text[:100])
-
             if fp in existing_fingerprints:
                 continue
 
@@ -82,7 +82,6 @@ class MergePipeline:
         for rd in reddit_records:
             url = sanitize_url(f"https://www.reddit.com/comments/{rd.post_id}") if rd.post_id else None
             fp = ("reddit", url or rd.body[:100])
-
             if fp in existing_fingerprints:
                 continue
 
@@ -115,7 +114,6 @@ class MergePipeline:
             raw_x_url = f"https://x.com/{x.handle}/status/{x.tweet_id}" if x.handle and x.tweet_id else None
             url = sanitize_url(raw_x_url)
             fp = ("x", url or x.text[:100])
-
             if fp in existing_fingerprints:
                 continue
 
@@ -138,7 +136,25 @@ class MergePipeline:
             source_breakdown["x"] += 1
             db.add(record)
 
-        # 5. Update Topic metadata
+        # 5. Enforce merged items budget
+        max_combined = resource_governor.budget_manager.get_limit("max_merged_items_per_topic")
+        actual_total = len(existing_combined) + len(new_combined_records)
+        if actual_total > max_combined and new_combined_records:
+            allowed_new = max(0, max_combined - len(existing_combined))
+            if allowed_new < len(new_combined_records):
+                logger.warning(
+                    "Truncating merged items for topic '%s': %d -> %d (budget: %d total)",
+                    topic.title,
+                    len(new_combined_records),
+                    allowed_new,
+                    max_combined,
+                )
+                # Remove excess records that were already added to the session
+                for excess_record in new_combined_records[allowed_new:]:
+                    db.expunge(excess_record)
+                new_combined_records = new_combined_records[:allowed_new]
+
+        # 6. Update Topic metadata
         total_combined = len(existing_combined) + len(new_combined_records)
         existing_coverage = topic.source_coverage or {}
         if not isinstance(existing_coverage, dict):

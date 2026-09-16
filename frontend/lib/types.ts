@@ -298,3 +298,76 @@ export interface OpsBackupsResponse {
   backups: BackupRecordItem[];
 }
 
+// ==========================================
+// Resource Governance Types
+// ==========================================
+
+export interface RateLimitInfo {
+  current: number;
+  limit: number;
+  window_seconds: number;
+  utilization_pct: number;
+}
+
+export interface ConcurrencyInfo {
+  current: number;
+  limit: number;
+  utilization_pct: number;
+}
+
+export interface BudgetUtilization {
+  current: number;
+  limit: number;
+  utilization_pct: number;
+  status: "normal" | "warning" | "critical";
+}
+
+export interface ExternalSourceUsage {
+  active_requests: number;
+  max_concurrent: number;
+  hourly_used: number;
+  hourly_budget: number;
+  timeout_seconds: number;
+  max_retries: number;
+  utilization_pct: number;
+}
+
+export interface CostTracking {
+  embedding_calls: number;
+  embedding_items_total: number;
+  synthesis_calls: number;
+  estimated_input_tokens: number;
+  estimated_output_tokens: number;
+  items_processed: number;
+  pipeline_invocations: number;
+  external_requests: Record<string, number>;
+}
+
+export interface ResourceUsageResponse {
+  rate_limits: Record<string, RateLimitInfo>;
+  concurrency: Record<string, ConcurrencyInfo>;
+  cost_tracking: CostTracking;
+  external_requests: Record<string, ExternalSourceUsage>;
+  synthesis_rate: Record<string, { current_hour: number; limit: number }>;
+  budget_utilization: Record<string, BudgetUtilization>;
+  thresholds: {
+    warning_threshold: number;
+    critical_threshold: number;
+  };
+}
+
+export interface ExternalSourceConfig {
+  max_concurrent: number;
+  timeout_seconds: number;
+  max_retries: number;
+  hourly_budget: number;
+}
+
+export interface ResourceBudgetsResponse {
+  budgets: Record<string, number>;
+  thresholds: {
+    warning_threshold: number;
+    critical_threshold: number;
+  };
+  external_source_governance: Record<string, ExternalSourceConfig>;
+}

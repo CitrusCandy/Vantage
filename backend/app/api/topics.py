@@ -1,12 +1,15 @@
 from datetime import datetime
+import logging
 import re
 from typing import Any, Dict, List, Optional
 import unicodedata
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.core import resource_governor
 from app.core.security import sanitize_search_query, validate_slug
 from app.database.database import get_db
 from app.database.models import Topic
@@ -21,7 +24,20 @@ from app.ingestion.pipeline import IngestionPipeline
 from app.llm.pipeline import PerspectivePipeline
 from app.processing.cluster_pipeline import ClusterPipeline
 
+logger = logging.getLogger("app.api.topics")
+
 router = APIRouter(prefix="/topics", tags=["Topics"])
+
+
+def _enforce_rate_limit(key: str):
+    """Check rate limit for the given key and raise HTTP 429 if exceeded."""
+    allowed, retry_after = resource_governor.rate_limiter.check_rate_limit(key)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded for {key}. Retry after {retry_after}s.",
+            headers={"Retry-After": str(int(retry_after))},
+        )
 
 
 def generate_slug(text: str) -> str:
@@ -56,6 +72,7 @@ def create_topic(
     topic_in: TopicCreate,
     db: Session = Depends(get_db),
 ):
+    _enforce_rate_limit("public:topic_create")
     """Create a new topic with initialized search/trending metrics and URL-safe slug."""
     raw_slug = topic_in.slug if topic_in.slug else generate_slug(topic_in.title)
     unique_slug = get_unique_slug(db, raw_slug)
@@ -106,7 +123,7 @@ def list_topics(
                     Topic.slug.ilike(search_term, escape="\\"),
                 )
             )
-    return query.order_by(Topic.updated_at.desc()).all()
+    return query.order_by(Topic.updated_at.desc()).limit(200).all()
 
 
 @router.get(
@@ -220,6 +237,7 @@ def ingest_topic(
     db: Session = Depends(get_db),
 ):
     """Trigger independent scrapers (Google News, Reddit, X) into staging tables followed by merge."""
+    _enforce_rate_limit("public:ingestion")
     topic = db.query(Topic).filter(Topic.slug == slug).first()
     if not topic:
         raise HTTPException(
@@ -227,8 +245,9 @@ def ingest_topic(
             detail=f"Topic with slug '{slug}' not found",
         )
 
+    clamped_limit = resource_governor.budget_manager.clamp("max_ingestion_items_per_source", limit_per_source)
     pipeline = IngestionPipeline()
-    return pipeline.run(topic=topic, db=db, limit_per_source=limit_per_source)
+    return pipeline.run(topic=topic, db=db, limit_per_source=clamped_limit)
 
 
 @router.post(
@@ -241,6 +260,7 @@ def merge_topic_staging(
     db: Session = Depends(get_db),
 ):
     """Execute merge/normalization from raw_google_news, raw_reddit, raw_x into combined_raw_data."""
+    _enforce_rate_limit("public:merge")
     topic = db.query(Topic).filter(Topic.slug == slug).first()
     if not topic:
         raise HTTPException(
@@ -267,6 +287,7 @@ def cluster_topic(
     db: Session = Depends(get_db),
 ):
     """Run preprocessing, embeddings generation, HDBSCAN clustering on combined dataset."""
+    _enforce_rate_limit("public:clustering")
     topic = db.query(Topic).filter(Topic.slug == slug).first()
     if not topic:
         raise HTTPException(
@@ -297,6 +318,7 @@ def synthesize_topic_perspectives(
     db: Session = Depends(get_db),
 ):
     """Extract representative cluster samples and synthesize structured perspectives using LLM."""
+    _enforce_rate_limit("public:synthesis")
     topic = db.query(Topic).filter(Topic.slug == slug).first()
     if not topic:
         raise HTTPException(
@@ -324,6 +346,7 @@ def run_full_pipeline(
     db: Session = Depends(get_db),
 ):
     """Execute complete end-to-end pipeline: Ingestion into staging -> Merge into combined_raw_data -> HDBSCAN clustering -> LLM synthesis."""
+    _enforce_rate_limit("public:pipeline")
     topic = db.query(Topic).filter(Topic.slug == slug).first()
     if not topic:
         raise HTTPException(
@@ -331,59 +354,76 @@ def run_full_pipeline(
             detail=f"Topic with slug '{slug}' not found",
         )
 
+    # Enforce pipeline concurrency limit
+    if not resource_governor.concurrency_governor.acquire("pipeline", holder_id=slug):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Maximum concurrent pipelines reached. Please try again later.",
+            headers={"Retry-After": "30"},
+        )
+
+    clamped_limit = resource_governor.budget_manager.clamp("max_ingestion_items_per_source", limit_per_source)
+    resource_governor.cost_tracker.record_pipeline_invocation()
+
     from app.core.telemetry import PipelineTimingTracker
     tracker = PipelineTimingTracker("end_to_end_pipeline", topic_slug=slug)
 
-    # 1. Ingest & Merge
-    with tracker.track("ingestion_and_merge"):
-        ingestion_pipeline = IngestionPipeline()
-        ingestion_res = ingestion_pipeline.run(topic=topic, db=db, limit_per_source=limit_per_source)
+    try:
+        # 1. Ingest & Merge
+        with tracker.track("ingestion_and_merge"):
+            ingestion_pipeline = IngestionPipeline()
+            ingestion_res = ingestion_pipeline.run(topic=topic, db=db, limit_per_source=clamped_limit)
 
-    # 2. HDBSCAN Cluster
-    with tracker.track("hdbscan_clustering"):
-        cluster_pipeline = ClusterPipeline()
-        cluster_res = cluster_pipeline.run_for_topic(
-            topic=topic,
-            db=db,
-            min_volume_threshold=min_volume_threshold,
-        )
-
-    # 3. LLM Synthesis
-    synthesis_res = None
-    if cluster_res.get("status") == "success":
-        with tracker.track("llm_perspective_synthesis"):
-            perspective_pipeline = PerspectivePipeline()
-            synthesis_res = perspective_pipeline.run_synthesis_for_topic(
+        # 2. HDBSCAN Cluster
+        with tracker.track("hdbscan_clustering"):
+            cluster_pipeline = ClusterPipeline()
+            cluster_res = cluster_pipeline.run_for_topic(
                 topic=topic,
                 db=db,
                 min_volume_threshold=min_volume_threshold,
-                cluster_data=cluster_res,
             )
 
-    # 4. Refresh trending score
-    with tracker.track("trending_score_recalculation"):
-        from app.workers.trending import TrendingScorer
-        scorer = TrendingScorer()
-        score_breakdown = scorer.calculate_topic_score(topic=topic, db=db)
-        topic.trending_score = score_breakdown.final_score
-        db.commit()
-        db.refresh(topic)
+        # 3. LLM Synthesis
+        synthesis_res = None
+        if cluster_res.get("status") == "success":
+            with tracker.track("llm_perspective_synthesis"):
+                perspective_pipeline = PerspectivePipeline()
+                synthesis_res = perspective_pipeline.run_synthesis_for_topic(
+                    topic=topic,
+                    db=db,
+                    min_volume_threshold=min_volume_threshold,
+                    cluster_data=cluster_res,
+                )
 
-    timings_summary = tracker.finish(status="success")
+        # 4. Refresh trending score
+        with tracker.track("trending_score_recalculation"):
+            from app.workers.trending import TrendingScorer
+            scorer = TrendingScorer()
+            score_breakdown = scorer.calculate_topic_score(topic=topic, db=db)
+            topic.trending_score = score_breakdown.final_score
+            db.commit()
+            db.refresh(topic)
 
-    return {
-        "status": "success",
-        "topic": {
-            "id": topic.id,
-            "slug": topic.slug,
-            "title": topic.title,
-            "trending_score": topic.trending_score,
-            "source_coverage": topic.source_coverage,
-            "perspectives_count": len(topic.perspectives) if topic.perspectives else 0,
-        },
-        "ingestion": ingestion_res,
-        "clustering": cluster_res,
-        "synthesis": synthesis_res,
-        "timings": timings_summary,
-    }
+        timings_summary = tracker.finish(status="success")
+
+        return {
+            "status": "success",
+            "topic": {
+                "id": topic.id,
+                "slug": topic.slug,
+                "title": topic.title,
+                "trending_score": topic.trending_score,
+                "source_coverage": topic.source_coverage,
+                "perspectives_count": len(topic.perspectives) if topic.perspectives else 0,
+            },
+            "ingestion": ingestion_res,
+            "clustering": cluster_res,
+            "synthesis": synthesis_res,
+            "timings": timings_summary,
+        }
+    except Exception:
+        tracker.finish(status="failed")
+        raise
+    finally:
+        resource_governor.concurrency_governor.release("pipeline", holder_id=slug)
 

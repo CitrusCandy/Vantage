@@ -91,4 +91,12 @@ X ────────────┘
    - **Retention Lifecycle**: Prunes expired backup files from storage and updates DB catalog according to `BACKUP_RETENTION_COUNT` and `BACKUP_RETENTION_DAYS`.
    - **Restoration Tooling**: Safe, verified CLI restoration (`python -m app.database.restore --confirm`) with explicit HTTP-endpoint isolation for maximum disaster protection.
 
-
+10. **Production Cost Control & Resource Governance** (`app.core.resource_governor`):
+    - **In-Process Rate Limiting**: Sliding-window token bucket rate limiter for all expensive/public API endpoints (topic creation, ingestion, merge, clustering, synthesis, full pipeline) and operational endpoints (trending discovery, reprocessing, backup, maintenance). Returns HTTP 429 with `Retry-After` header when limits are exceeded. Configurable requests/window per endpoint via environment variables. Bounded memory with periodic expired bucket cleanup.
+    - **Resource Budget Manager**: Configurable limits for ingestion items per source, merged items per topic, processing items, embedding batch sizes, embeddings per run, clusters to LLM, samples per cluster, synthesis calls per topic/hour, concurrent pipelines, concurrent source calls, backup operations, and maintenance operations. All limits loaded from environment variables with sensible defaults.
+    - **Cost-Control Tracking**: Thread-safe counters for embedding calls/items, synthesis calls/estimated tokens, pipeline invocations, and external requests per source. Metadata-only tracking — never stores prompt contents or raw source text.
+    - **Concurrency Governor**: Bounded semaphore-style acquire/release for pipelines, source calls, backups, and maintenance. Context manager support guarantees slot release on failure. `release_all()` on scheduler shutdown.
+    - **External API Request Governance**: Per-source (Google News, Reddit, X, OpenAI) settings for concurrent request limits, timeouts, max retries, exponential backoff, and hourly request budgets. Fail-soft: returns empty/default on budget exhaustion rather than crashing.
+    - **Utilization Monitoring**: Configurable warning (70%) and critical (90%) thresholds. Budget utilization status classification (`normal`, `warning`, `critical`) exposed via operational endpoints and frontend dashboard.
+    - **Operational Endpoints**: `GET /api/ops/resource-usage` returns comprehensive resource governance metrics. `GET /api/ops/resource-budgets` returns all configured budget limits. Both protected by `X-Ops-Key` guard.
+    - **Frontend Governance Dashboard**: Resource Governance section on `/ops` with rate limit utilization bars, concurrency slot indicators, cost tracking counters, budget utilization warnings, and external source governance panels.

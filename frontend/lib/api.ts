@@ -6,6 +6,8 @@ import {
   OpsSourceHealth,
   OpsWorkerMetrics,
   Perspective,
+  ResourceBudgetsResponse,
+  ResourceUsageResponse,
   Topic,
   TopicCreate,
   WorkerStatus,
@@ -15,16 +17,74 @@ const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL ||
   (typeof window === "undefined" ? "http://127.0.0.1:8000/api" : "/api");
 
-async function fetchJson<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+// Minimum polling interval (ms) — prevents hammering the backend
+const MIN_POLL_INTERVAL_MS = parseInt(
+  process.env.NEXT_PUBLIC_MIN_POLL_INTERVAL_MS || "15000",
+  10,
+);
+
+// Request deduplication: track in-flight requests by key
+const _inflightControllers: Map<string, AbortController> = new Map();
+
+/**
+ * Cancel any in-flight request for the same deduplication key before starting a new one.
+ * Returns an AbortController signal to pass to the request.
+ */
+function _deduplicatedSignal(key?: string): AbortSignal | undefined {
+  if (!key) return undefined;
+  const existing = _inflightControllers.get(key);
+  if (existing) {
+    existing.abort(); // Cancel stale request
+  }
+  const controller = new AbortController();
+  _inflightControllers.set(key, controller);
+  return controller.signal;
+}
+
+function _clearInflight(key?: string) {
+  if (key) _inflightControllers.delete(key);
+}
+
+/** Custom error class for rate-limited responses. */
+export class RateLimitError extends Error {
+  retryAfter: number;
+  constructor(retryAfter: number, detail: string) {
+    super(detail);
+    this.name = "RateLimitError";
+    this.retryAfter = retryAfter;
+  }
+}
+
+async function fetchJson<T>(
+  endpoint: string,
+  options: RequestInit = {},
+  dedupKey?: string,
+): Promise<T> {
   const url = `${API_BASE_URL}${endpoint}`;
+  const signal = _deduplicatedSignal(dedupKey);
   const response = await fetch(url, {
     ...options,
+    signal,
     headers: {
       "Content-Type": "application/json",
       ...(options.headers || {}),
     },
     cache: "no-store",
   });
+
+  _clearInflight(dedupKey);
+
+  if (response.status === 429) {
+    const retryAfter = parseInt(response.headers.get("Retry-After") || "30", 10);
+    let detail = `Rate limited. Retry after ${retryAfter}s.`;
+    try {
+      const err = await response.json();
+      detail = err.detail || detail;
+    } catch {
+      // Ignore JSON parse errors for rate-limit responses
+    }
+    throw new RateLimitError(retryAfter, detail);
+  }
 
   if (!response.ok) {
     let errorDetail = "API Request failed";
@@ -42,11 +102,11 @@ async function fetchJson<T>(endpoint: string, options: RequestInit = {}): Promis
 
 export async function getTopics(search?: string): Promise<Topic[]> {
   const query = search ? `?search=${encodeURIComponent(search)}` : "";
-  return fetchJson<Topic[]>(`/topics${query}`);
+  return fetchJson<Topic[]>(`/topics${query}`, {}, "getTopics");
 }
 
 export async function getTrendingTopics(limit: number = 8, minScore: number = 0.0): Promise<Topic[]> {
-  return fetchJson<Topic[]>(`/topics/trending?limit=${limit}&min_score=${minScore}`);
+  return fetchJson<Topic[]>(`/topics/trending?limit=${limit}&min_score=${minScore}`, {}, "getTrending");
 }
 
 export async function getTopicBySlug(slug: string): Promise<Topic> {
@@ -113,19 +173,19 @@ export async function discoverCandidateTrends(limitPerProvider: number = 10): Pr
 // ==========================================
 
 export async function getOpsOverview(): Promise<OpsOverview> {
-  return fetchJson<OpsOverview>("/ops/overview");
+  return fetchJson<OpsOverview>("/ops/overview", {}, "getOpsOverview");
 }
 
 export async function getOpsPipelineMetrics(): Promise<OpsPipelineMetrics> {
-  return fetchJson<OpsPipelineMetrics>("/ops/pipeline-metrics");
+  return fetchJson<OpsPipelineMetrics>("/ops/pipeline-metrics", {}, "getOpsPipelineMetrics");
 }
 
 export async function getOpsSourceHealth(): Promise<OpsSourceHealth> {
-  return fetchJson<OpsSourceHealth>("/ops/source-health");
+  return fetchJson<OpsSourceHealth>("/ops/source-health", {}, "getOpsSourceHealth");
 }
 
 export async function getOpsWorkerMetrics(): Promise<OpsWorkerMetrics> {
-  return fetchJson<OpsWorkerMetrics>("/ops/worker-metrics");
+  return fetchJson<OpsWorkerMetrics>("/ops/worker-metrics", {}, "getOpsWorkerMetrics");
 }
 
 export async function triggerOpsTrending(apiKey?: string): Promise<any> {
@@ -157,7 +217,7 @@ export async function triggerOpsReprocessTopic(slug: string, apiKey?: string): P
 
 export async function getOpsAlerts(autoEvaluate?: boolean): Promise<AlertSummary> {
   const query = autoEvaluate ? "?auto_evaluate=true" : "";
-  return fetchJson<AlertSummary>(`/ops/alerts${query}`);
+  return fetchJson<AlertSummary>(`/ops/alerts${query}`, {}, "getOpsAlerts");
 }
 
 export async function triggerOpsAlertEvaluate(apiKey?: string): Promise<AlertSummary> {
@@ -190,11 +250,11 @@ export async function getOpsHistory(params?: {
   if (params?.limit) queryParts.push(`limit=${params.limit}`);
 
   const qs = queryParts.length > 0 ? `?${queryParts.join("&")}` : "";
-  return fetchJson<import("./types").OpsHistoryResponse>(`/ops/history${qs}`);
+  return fetchJson<import("./types").OpsHistoryResponse>(`/ops/history${qs}`, {}, "getOpsHistory");
 }
 
 export async function getOpsBackups(limit: number = 20): Promise<import("./types").OpsBackupsResponse> {
-  return fetchJson<import("./types").OpsBackupsResponse>(`/ops/backups?limit=${limit}`);
+  return fetchJson<import("./types").OpsBackupsResponse>(`/ops/backups?limit=${limit}`, {}, "getOpsBackups");
 }
 
 export async function triggerOpsCreateBackup(apiKey?: string, dryRun?: boolean): Promise<any> {
@@ -216,4 +276,23 @@ export async function triggerOpsVerifyBackup(backupId: string, apiKey?: string):
   });
 }
 
+// ==========================================
+// Resource Governance APIs
+// ==========================================
 
+export async function getResourceUsage(apiKey?: string): Promise<ResourceUsageResponse> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["X-Ops-Key"] = apiKey;
+  return fetchJson<ResourceUsageResponse>("/ops/resource-usage", { headers }, "getResourceUsage");
+}
+
+export async function getResourceBudgets(apiKey?: string): Promise<ResourceBudgetsResponse> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["X-Ops-Key"] = apiKey;
+  return fetchJson<ResourceBudgetsResponse>("/ops/resource-budgets", { headers }, "getResourceBudgets");
+}
+
+/** Utility: get minimum safe polling interval in ms. */
+export function getMinPollIntervalMs(): number {
+  return MIN_POLL_INTERVAL_MS;
+}

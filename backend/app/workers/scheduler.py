@@ -10,6 +10,15 @@ from app.workers.worker_config import WorkerConfig, get_worker_config
 logger = logging.getLogger("app.workers.scheduler")
 
 
+def _get_concurrency_governor():
+    """Lazy import to avoid circular dependency."""
+    try:
+        from app.core import resource_governor
+        return resource_governor.concurrency_governor
+    except (ImportError, AttributeError):
+        return None
+
+
 class BackgroundScheduler:
     """Lightweight background thread scheduler for periodic trending discovery and topic refresh."""
 
@@ -59,6 +68,11 @@ class BackgroundScheduler:
         if self._thread:
             self._thread.join(timeout=timeout_seconds)
             logger.info("BackgroundScheduler stopped gracefully.")
+
+        # Release all held concurrency slots on shutdown
+        gov = _get_concurrency_governor()
+        if gov:
+            gov.release_all()
 
     def run_scheduled_backup(self) -> Optional[Dict[str, Any]]:
         """Execute a scheduled database backup with fail-soft isolation."""

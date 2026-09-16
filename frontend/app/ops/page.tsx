@@ -42,6 +42,9 @@ import {
   getOpsPipelineMetrics,
   getOpsSourceHealth,
   getOpsWorkerMetrics,
+  getResourceUsage,
+  getResourceBudgets,
+  RateLimitError,
   triggerOpsAlertEvaluate,
   triggerOpsCreateBackup,
   triggerOpsRefreshTopic,
@@ -62,6 +65,8 @@ import {
   OpsPipelineMetrics,
   OpsSourceHealth,
   OpsWorkerMetrics,
+  ResourceUsageResponse,
+  ResourceBudgetsResponse,
 } from "@/lib/types";
 import { formatDate, formatTimeAgo } from "@/lib/utils";
 
@@ -97,6 +102,10 @@ export default function OperationsPage() {
   const [isBackupsLoading, setIsBackupsLoading] = useState<boolean>(false);
   const [isCreatingBackup, setIsCreatingBackup] = useState<boolean>(false);
   const [verifyingBackupId, setVerifyingBackupId] = useState<string | null>(null);
+
+  // Resource Governance State
+  const [resourceUsage, setResourceUsage] = useState<ResourceUsageResponse | null>(null);
+  const [resourceBudgets, setResourceBudgets] = useState<ResourceBudgetsResponse | null>(null);
 
   const loadBackups = async () => {
     try {
@@ -162,6 +171,17 @@ export default function OperationsPage() {
       setWorkerMetrics(wm);
       setAlertsSummary(al);
       loadBackups();
+      // Load resource governance data
+      try {
+        const [ru, rb] = await Promise.all([
+          getResourceUsage(opsApiKey || undefined),
+          getResourceBudgets(opsApiKey || undefined),
+        ]);
+        setResourceUsage(ru);
+        setResourceBudgets(rb);
+      } catch (err: any) {
+        console.error("Failed to load resource governance data:", err);
+      }
       setLastUpdated(new Date());
     } catch (err: any) {
       console.error("Failed to load operations telemetry:", err);
@@ -183,7 +203,11 @@ export default function OperationsPage() {
       });
       loadAllTelemetry();
     } catch (err: any) {
-      setActionMessage({ type: "error", text: err.message || "Failed to trigger alert evaluation" });
+      if (err instanceof RateLimitError) {
+        setActionMessage({ type: "error", text: `Rate limited. Retry in ${err.retryAfter}s.` });
+      } else {
+        setActionMessage({ type: "error", text: err.message || "Failed to trigger alert evaluation" });
+      }
     } finally {
       setIsActionRunning(false);
     }
@@ -235,7 +259,11 @@ export default function OperationsPage() {
       });
       loadAllTelemetry();
     } catch (err: any) {
-      setActionMessage({ type: "error", text: err.message || "Failed to trigger trending discovery" });
+      if (err instanceof RateLimitError) {
+        setActionMessage({ type: "error", text: `Rate limited. Retry in ${err.retryAfter}s.` });
+      } else {
+        setActionMessage({ type: "error", text: err.message || "Failed to trigger trending discovery" });
+      }
     } finally {
       setIsActionRunning(false);
     }
@@ -1428,6 +1456,212 @@ export default function OperationsPage() {
                 >
                   Next <ChevronRight className="w-3.5 h-3.5" />
                 </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 7. Resource Governance Section */}
+        <div className="p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Sliders className="w-5 h-5 text-cyan-400" />
+              <h2 className="text-base font-semibold text-white">Resource Governance & Cost Controls</h2>
+            </div>
+            <span className="text-[11px] text-slate-400">Rate Limits • Budgets • Concurrency</span>
+          </div>
+
+          {/* Rate Limits Grid */}
+          {resourceUsage && (
+            <div className="space-y-4">
+              <span className="text-xs font-semibold text-slate-300 block">API Rate Limits</span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {Object.entries(resourceUsage.rate_limits).map(([key, info]) => {
+                  const statusColor =
+                    info.utilization_pct >= 90
+                      ? "from-rose-500 to-red-500"
+                      : info.utilization_pct >= 70
+                        ? "from-amber-500 to-yellow-500"
+                        : "from-cyan-500 to-blue-500";
+                  const statusBadge =
+                    info.utilization_pct >= 90
+                      ? "bg-rose-500/15 text-rose-300 border-rose-500/25"
+                      : info.utilization_pct >= 70
+                        ? "bg-amber-500/15 text-amber-300 border-amber-500/25"
+                        : "bg-slate-800/40 text-slate-400 border-white/5";
+                  return (
+                    <div
+                      key={key}
+                      className="p-3 rounded-xl bg-slate-900/60 border border-white/[0.04] space-y-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-mono text-slate-300 capitalize">
+                          {key.replace(/[:_]/g, " ")}
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${statusBadge}`}
+                        >
+                          {info.current}/{info.limit}
+                        </span>
+                      </div>
+                      <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full bg-gradient-to-r ${statusColor} transition-all duration-500`}
+                          style={{ width: `${Math.min(100, info.utilization_pct)}%` }}
+                        />
+                      </div>
+                      <span className="text-[10px] text-slate-500">
+                        {info.window_seconds}s window • {info.utilization_pct}% used
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Concurrency & Budget Status */}
+          {resourceUsage && (
+            <div className="space-y-4">
+              <span className="text-xs font-semibold text-slate-300 block">Concurrency Slots & Budgets</span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                {Object.entries(resourceUsage.concurrency).map(([resource, info]) => {
+                  const statusColor =
+                    info.utilization_pct >= 90
+                      ? "text-rose-400"
+                      : info.utilization_pct >= 70
+                        ? "text-amber-400"
+                        : "text-emerald-400";
+                  return (
+                    <div
+                      key={resource}
+                      className="p-3.5 rounded-xl bg-slate-900/60 border border-white/[0.04] flex items-center justify-between"
+                    >
+                      <div>
+                        <span className="text-[11px] text-slate-400 block capitalize">
+                          {resource.replace(/_/g, " ")}
+                        </span>
+                        <span className={`text-sm font-bold font-mono ${statusColor}`}>
+                          {info.current}/{info.limit}
+                        </span>
+                      </div>
+                      <span className="text-[10px] text-slate-500">{info.utilization_pct}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Cost Tracking */}
+          {resourceUsage && (
+            <div className="space-y-4">
+              <span className="text-xs font-semibold text-slate-300 block">Cost Tracking (Session)</span>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                {[
+                  { label: "Embedding Calls", value: resourceUsage.cost_tracking.embedding_calls },
+                  { label: "Embedding Items", value: resourceUsage.cost_tracking.embedding_items_total },
+                  { label: "Synthesis Calls", value: resourceUsage.cost_tracking.synthesis_calls },
+                  { label: "Est. Input Tokens", value: resourceUsage.cost_tracking.estimated_input_tokens.toLocaleString() },
+                  { label: "Est. Output Tokens", value: resourceUsage.cost_tracking.estimated_output_tokens.toLocaleString() },
+                  { label: "Pipelines Run", value: resourceUsage.cost_tracking.pipeline_invocations },
+                ].map((stat) => (
+                  <div
+                    key={stat.label}
+                    className="p-3 rounded-xl bg-slate-900/60 border border-white/[0.04] text-center"
+                  >
+                    <span className="text-[10px] text-slate-400 block mb-0.5">{stat.label}</span>
+                    <span className="text-sm font-bold text-white font-mono">{stat.value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Budget Utilization Warnings */}
+          {resourceUsage && (
+            <div className="space-y-4">
+              <span className="text-xs font-semibold text-slate-300 block">Budget Utilization</span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {Object.entries(resourceUsage.budget_utilization)
+                  .filter(([_, info]) => info.limit > 0)
+                  .map(([resource, info]) => {
+                    const borderColor =
+                      info.status === "critical"
+                        ? "border-rose-500/30"
+                        : info.status === "warning"
+                          ? "border-amber-500/30"
+                          : "border-white/[0.04]";
+                    const statusIcon =
+                      info.status === "critical" ? (
+                        <AlertOctagon className="w-3.5 h-3.5 text-rose-400" />
+                      ) : info.status === "warning" ? (
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                      ) : (
+                        <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
+                      );
+                    return (
+                      <div
+                        key={resource}
+                        className={`p-3 rounded-xl bg-slate-900/60 border ${borderColor} flex items-center justify-between`}
+                      >
+                        <div className="flex items-center gap-2">
+                          {statusIcon}
+                          <span className="text-[11px] text-slate-300 capitalize">
+                            {resource.replace(/max_|_/g, (m) => (m === "_" ? " " : ""))}
+                          </span>
+                        </div>
+                        <span className="text-[11px] font-mono text-slate-400">
+                          {info.current}/{info.limit}
+                        </span>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          )}
+
+          {/* External Source Governance */}
+          {resourceUsage && (
+            <div className="space-y-4">
+              <span className="text-xs font-semibold text-slate-300 block">External API Request Governance</span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {Object.entries(resourceUsage.external_requests).map(([source, usage]) => {
+                  const barColor =
+                    usage.utilization_pct >= 90
+                      ? "from-rose-500 to-red-500"
+                      : usage.utilization_pct >= 70
+                        ? "from-amber-500 to-yellow-500"
+                        : "from-emerald-500 to-cyan-500";
+                  return (
+                    <div
+                      key={source}
+                      className="p-3.5 rounded-xl bg-slate-900/60 border border-white/[0.04] space-y-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold text-white capitalize">
+                          {source.replace(/_/g, " ")}
+                        </span>
+                        <div className="flex items-center gap-2 text-[10px] text-slate-400">
+                          <span>Active: {usage.active_requests}/{usage.max_concurrent}</span>
+                          <span>•</span>
+                          <span>Hourly: {usage.hourly_used}/{usage.hourly_budget}</span>
+                        </div>
+                      </div>
+                      <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full bg-gradient-to-r ${barColor} transition-all duration-500`}
+                          style={{ width: `${Math.min(100, usage.utilization_pct)}%` }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between text-[10px] text-slate-500">
+                        <span>Timeout: {usage.timeout_seconds}s</span>
+                        <span>Max retries: {usage.max_retries}</span>
+                        <span>{usage.utilization_pct}% hourly budget</span>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

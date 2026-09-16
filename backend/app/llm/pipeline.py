@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core import resource_governor
 from app.core.telemetry import PipelineTimingTracker
 from app.database.models import Perspective, Topic
 from app.llm.perspective import (
@@ -23,13 +24,13 @@ class PerspectivePipeline:
         self,
         synthesizer: Optional[BasePerspectiveSynthesizer] = None,
         cluster_pipeline: Optional[ClusterPipeline] = None,
-        max_top_clusters: int = 10,
-        max_samples_per_cluster: int = 20,
+        max_top_clusters: Optional[int] = None,
+        max_samples_per_cluster: Optional[int] = None,
     ):
         self.synthesizer = synthesizer or get_perspective_synthesizer()
         self.cluster_pipeline = cluster_pipeline or ClusterPipeline()
-        self.max_top_clusters = max_top_clusters
-        self.max_samples_per_cluster = max_samples_per_cluster
+        self.max_top_clusters = max_top_clusters or resource_governor.budget_manager.get_limit("max_clusters_to_llm")
+        self.max_samples_per_cluster = max_samples_per_cluster or resource_governor.budget_manager.get_limit("max_samples_per_cluster")
 
     def run_synthesis_for_topic(
         self,
@@ -44,6 +45,21 @@ class PerspectivePipeline:
             topic.id,
             topic.title,
         )
+
+        # Check synthesis rate budget for this topic
+        allowed, current, limit = resource_governor.synthesis_tracker.check_and_record(topic.slug)
+        if not allowed:
+            logger.warning(
+                "Synthesis rate limit exceeded for topic '%s': %d/%d per hour",
+                topic.slug, current, limit,
+            )
+            return {
+                "status": "rate_limited",
+                "message": f"Synthesis rate limit exceeded ({current}/{limit} per hour for topic '{topic.slug}')",
+                "topic_id": topic.id,
+                "topic_slug": topic.slug,
+            }
+
         tracker = PipelineTimingTracker("perspective_pipeline")
 
         # 1. Ensure Clustering Exists
@@ -115,6 +131,14 @@ class PerspectivePipeline:
                 topic_title=topic.title,
                 cluster_payloads=prepared_clusters,
                 total_sample_size=total_sample_size,
+            )
+            # Track synthesis cost (estimate tokens from cluster payload size)
+            total_samples = sum(len(c.get("representative_samples", [])) for c in prepared_clusters)
+            estimated_input = total_samples * 50  # ~50 tokens per sample estimate
+            estimated_output = len(synthesis_output.perspectives) * 200  # ~200 tokens per perspective
+            resource_governor.cost_tracker.record_synthesis_call(
+                estimated_input_tokens=estimated_input,
+                estimated_output_tokens=estimated_output,
             )
 
         # 4. Idempotently Replace Stale Perspectives for Topic

@@ -56,6 +56,13 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
                 "OPENAI_API_KEY is not set. Please set the OPENAI_API_KEY environment variable."
             )
 
+        # Clamp batch size to budget limit
+        try:
+            from app.core import resource_governor
+            batch_size = resource_governor.budget_manager.clamp("max_embedding_batch_size", batch_size)
+        except ImportError:
+            pass
+
         all_embeddings: List[List[float]] = []
 
         for i in range(0, len(texts), batch_size):

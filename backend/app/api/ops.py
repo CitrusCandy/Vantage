@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.alerting import alert_manager
+from app.core import resource_governor
 from app.core.security import validate_slug
 from app.core.telemetry import PipelineTimingTracker, ops_metrics
 from app.database.database import get_db
@@ -24,6 +25,17 @@ from app.workers.trending import TrendingScorer
 logger = logging.getLogger("app.api.ops")
 
 router = APIRouter(prefix="/ops", tags=["Operations & Observability"])
+
+
+def _enforce_ops_rate_limit(key: str):
+    """Check rate limit for ops key and raise HTTP 429 if exceeded."""
+    allowed, retry_after = resource_governor.rate_limiter.check_rate_limit(key)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded for {key}. Retry after {retry_after}s.",
+            headers={"Retry-After": str(int(retry_after))},
+        )
 
 
 def verify_ops_control_access(
@@ -494,6 +506,7 @@ def trigger_ops_trending_discovery(
     limit_per_provider: int = Query(default=10, ge=1, le=50),
 ) -> Dict[str, Any]:
     """Trigger external trend signal discovery across providers."""
+    _enforce_ops_rate_limit("ops:trending")
     try:
         return run_candidate_discovery_job(limit_per_provider=limit_per_provider)
     except Exception as e:
@@ -564,6 +577,7 @@ def trigger_ops_reprocess_topic(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Execute complete end-to-end pipeline reprocessing with structured telemetry tracking."""
+    _enforce_ops_rate_limit("ops:reprocess_topic")
     if not validate_slug(slug):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -693,6 +707,7 @@ def trigger_ops_create_backup(
     """Execute logical database backup with SHA-256 checksum and metadata persistence."""
     from app.database.backup import BackupConfig, create_backup
 
+    _enforce_ops_rate_limit("ops:backup_create")
     try:
         cfg = BackupConfig()
         result = create_backup(db=db, config=cfg, dry_run=dry_run)
@@ -732,4 +747,79 @@ def trigger_ops_verify_backup(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Backup verification failed: {str(e)[:120]}",
         )
+
+
+# ==========================================
+# Resource Governance Endpoints
+# ==========================================
+
+
+@router.get(
+    "/resource-usage",
+    summary="Get current resource utilization, rate-limit usage, and budget status",
+    dependencies=[Depends(verify_ops_control_access)],
+)
+def get_resource_usage() -> Dict[str, Any]:
+    """Return comprehensive resource governance metrics without exposing secrets."""
+    rate_limit_usage = resource_governor.rate_limiter.get_usage()
+    concurrency_usage = resource_governor.concurrency_governor.get_usage()
+    cost_usage = resource_governor.cost_tracker.get_usage()
+    external_usage = resource_governor.external_governor.get_usage()
+    synthesis_usage = resource_governor.synthesis_tracker.get_usage()
+    budgets = resource_governor.budget_manager.get_all_budgets()
+    thresholds = resource_governor.utilization_monitor.get_thresholds()
+
+    # Compute budget utilization percentages with warning status
+    budget_utilization = {}
+    for resource, limit in budgets.items():
+        current = 0
+        if resource == "max_concurrent_pipelines":
+            current = concurrency_usage.get("pipeline", {}).get("current", 0)
+        elif resource == "max_concurrent_source_calls":
+            current = concurrency_usage.get("source_call", {}).get("current", 0)
+        elif resource == "max_backup_operations":
+            current = concurrency_usage.get("backup", {}).get("current", 0)
+        elif resource == "max_maintenance_operations":
+            current = concurrency_usage.get("maintenance", {}).get("current", 0)
+
+        pct = round((current / limit) * 100, 1) if limit > 0 else 0.0
+        status_val = resource_governor.utilization_monitor.get_status(current, limit)
+        budget_utilization[resource] = {
+            "current": current,
+            "limit": limit,
+            "utilization_pct": pct,
+            "status": status_val,
+        }
+
+    return {
+        "rate_limits": rate_limit_usage,
+        "concurrency": concurrency_usage,
+        "cost_tracking": cost_usage,
+        "external_requests": external_usage,
+        "synthesis_rate": synthesis_usage,
+        "budget_utilization": budget_utilization,
+        "thresholds": thresholds,
+    }
+
+
+@router.get(
+    "/resource-budgets",
+    summary="Get active configured resource budget limits",
+    dependencies=[Depends(verify_ops_control_access)],
+)
+def get_resource_budgets() -> Dict[str, Any]:
+    """Return all configured resource budget limits without exposing secrets."""
+    return {
+        "budgets": resource_governor.budget_manager.get_all_budgets(),
+        "thresholds": resource_governor.utilization_monitor.get_thresholds(),
+        "external_source_governance": {
+            source: {
+                "max_concurrent": data.get("max_concurrent"),
+                "timeout_seconds": data.get("timeout_seconds"),
+                "max_retries": data.get("max_retries"),
+                "hourly_budget": data.get("hourly_budget"),
+            }
+            for source, data in resource_governor.external_governor.get_usage().items()
+        },
+    }
 

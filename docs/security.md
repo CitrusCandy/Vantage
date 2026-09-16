@@ -72,4 +72,29 @@ The CI quality gate and local `scripts/verify_release.py` automatically scan all
 - **SHA-256 Integrity Verification**:
   - In-flight SHA-256 computation ensures that any tampered, incomplete, or corrupted backup file fails verification and is prevented from being marked healthy.
 
+---
 
+## 8. Rate Limiting & Resource Governance Security
+
+- **In-Process Rate Limiting**:
+  - Sliding-window token bucket rate limiter applied to all expensive public endpoints (topic creation, ingestion, merge, clustering, synthesis, full pipeline) and operational endpoints (trending, reprocessing, backup, maintenance).
+  - Returns HTTP 429 with `Retry-After` header when limits are exceeded.
+  - Rate limits are configurable per endpoint via `RATE_LIMIT_<KEY>` environment variables.
+  - Bounded memory: expired buckets are periodically cleaned up. Hard cap of 10,000 tracked keys prevents unbounded state growth.
+- **Resource Budget Enforcement**:
+  - Configurable limits prevent runaway costs: ingestion items per source, merged items per topic, embedding batch sizes, embeddings per run, clusters sent to LLM, samples per cluster, synthesis calls per topic/hour, concurrent pipelines, concurrent source calls.
+  - Budget violations are rejected before expensive API calls are made. Budgets never silently exceeded.
+- **Concurrency Governance**:
+  - Bounded semaphore-style concurrency control for pipelines, source calls, backups, and maintenance operations.
+  - Context manager guarantees slot release on success or failure. Scheduler shutdown releases all held slots.
+  - Duplicate holder detection prevents the same pipeline from acquiring multiple concurrent slots.
+- **External API Request Governance**:
+  - Per-source (Google News, Reddit, X, OpenAI) settings for maximum concurrent requests, timeouts, maximum retries, exponential backoff base, and hourly request budgets.
+  - Budget exhaustion causes fail-soft behavior (empty/default results) rather than crashing or indefinite retries.
+  - Does not bypass external provider rate limits; operates as a client-side governor.
+- **Cost-Control Tracking**:
+  - Tracks embedding calls/items, synthesis calls/estimated tokens, pipeline invocations, and external requests per source.
+  - **Metadata-only**: never stores prompt contents, raw source text, completion payloads, or API keys in tracking data.
+- **Operational API Protection**:
+  - `GET /api/ops/resource-usage` and `GET /api/ops/resource-budgets` are protected by the existing `X-Ops-Key` guard.
+  - No secrets, credentials, or configuration passwords are exposed through resource governance endpoints.
