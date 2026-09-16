@@ -1,0 +1,66 @@
+version: "3.8"
+
+services:
+  # Database Service (PostgreSQL 16)
+  db:
+    image: postgres:16-alpine
+    container_name: vantage-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: vantage_secret_password
+      POSTGRES_DB: vantage_news
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vantage_news"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Backend Service (FastAPI)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vantage-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:vantage_secret_password@db:5432/vantage_news
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_PERSPECTIVE_MODEL: ${OPENAI_PERSPECTIVE_MODEL:-gpt-4o-mini}
+      REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID:-}
+      REDDIT_CLIENT_SECRET: ${REDDIT_CLIENT_SECRET:-}
+      REDDIT_USER_AGENT: ${REDDIT_USER_AGENT:-VantageNews/2.0.0}
+      TRENDING_W1_VELOCITY: ${TRENDING_W1_VELOCITY:-0.35}
+      TRENDING_W2_SOURCES: ${TRENDING_W2_SOURCES:-0.25}
+      TRENDING_W3_ENGAGEMENT: ${TRENDING_W3_ENGAGEMENT:-0.25}
+      TRENDING_W4_DECAY: ${TRENDING_W4_DECAY:-0.15}
+      WORKER_INTERVAL_HOURS: ${WORKER_INTERVAL_HOURS:-2.0}
+      MIN_TRENDING_SCORE_REFRESH: ${MIN_TRENDING_SCORE_REFRESH:-0.20}
+      STAGNANT_HOURS_THRESHOLD: ${STAGNANT_HOURS_THRESHOLD:-48.0}
+    ports:
+      - "8000:8000"
+
+  # Frontend Service (Next.js)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vantage-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+    driver: local

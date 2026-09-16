@@ -119,6 +119,52 @@ Frontend will be running at: `http://localhost:3000`
 
 ---
 
+### 3. Docker Compose (Full Stack)
+
+To run the full stack (PostgreSQL + FastAPI backend + Next.js frontend) in containerized production mode:
+
+```bash
+# Start all services
+docker compose up --build -d
+
+# View logs
+docker compose logs -f
+
+# Stop all services
+docker compose down
+```
+
+Services will be accessible at:
+- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:8000`
+- PostgreSQL: `localhost:5432`
+
+---
+
+## Production Configuration Audit
+
+| Variable | Category | Default / Local Dev | Description |
+| :--- | :--- | :--- | :--- |
+| `DATABASE_URL` | **Required (Prod)** | `postgresql://postgres:password@localhost:5432/vantage_news` | PostgreSQL or SQLite connection URI |
+| `OPENAI_API_KEY` | **Required (Prod)** | *(Empty in tests / offline mock)* | OpenAI API key for embeddings & synthesis |
+| `OPENAI_PERSPECTIVE_MODEL` | Optional | `gpt-4o-mini` | OpenAI chat completion model |
+| `EMBEDDING_PROVIDER` | Optional | `openai` | Embedding model provider (`openai` / `mock`) |
+| `LLM_PROVIDER` | Optional | `openai` | Perspective synthesis provider (`openai` / `mock`) |
+| `REDDIT_CLIENT_ID` | Optional | *(Empty / public fallback)* | Reddit developer script client ID |
+| `REDDIT_CLIENT_SECRET` | Optional | *(Empty / public fallback)* | Reddit developer client secret |
+| `REDDIT_USER_AGENT` | Optional | `VantageNews/2.0.0` | Reddit custom user-agent header |
+| `TRENDING_W1_VELOCITY` | Optional | `0.35` | Trending score weight: 24h mention velocity |
+| `TRENDING_W2_SOURCES` | Optional | `0.25` | Trending score weight: unique platforms count |
+| `TRENDING_W3_ENGAGEMENT` | Optional | `0.25` | Trending score weight: log engagement rate |
+| `TRENDING_W4_DECAY` | Optional | `0.15` | Trending score penalty weight: exponential time decay |
+| `WORKER_INTERVAL_HOURS` | Optional | `2.0` | Background worker cadence interval (hours) |
+| `MIN_TRENDING_SCORE_REFRESH` | Optional | `0.20` | Minimum score threshold for automated ML refresh |
+| `STAGNANT_HOURS_THRESHOLD` | Optional | `48.0` | Inactivity threshold before marking topic stagnant |
+| `DECAY_HALF_LIFE_HOURS` | Optional | `24.0` | Half-life constant for exponential score decay |
+| `NEXT_PUBLIC_API_URL` | Optional (Frontend) | `http://localhost:8000/api` | Base URL for FastAPI backend proxy |
+
+---
+
 ## API Highlights
 
 - `GET /api/topics/trending` — Top viral topics ranked via multi-source velocity, reach, and time decay.
@@ -127,3 +173,4 @@ Frontend will be running at: `http://localhost:3000`
 - `POST /api/topics/{slug}/run-pipeline` — Execute full end-to-end flow: Ingestion $\rightarrow$ Staging $\rightarrow$ Merge $\rightarrow$ HDBSCAN Clustering $\rightarrow$ LLM Synthesis.
 - `GET /api/workers/status` — Inspect background scheduler status.
 - `POST /api/workers/refresh-trending` — Trigger background topic refresh cycle.
+
