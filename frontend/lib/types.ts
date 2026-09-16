@@ -83,6 +83,43 @@ export interface OpsPipelineRun {
   timestamp: string;
 }
 
+export type AlertSeverity = "info" | "warning" | "critical";
+
+export interface AlertInstance {
+  id: string;
+  rule_name: string;
+  severity: AlertSeverity;
+  component: string;
+  message: string;
+  status: "active" | "resolved";
+  first_seen: string;
+  last_seen: string;
+  resolved_at?: string | null;
+  occurrence_count: number;
+  metadata?: Record<string, any>;
+}
+
+export interface AlertSummary {
+  last_evaluation_time: string | null;
+  active_count: number;
+  resolved_count: number;
+  active_alerts: AlertInstance[];
+  resolved_alerts: AlertInstance[];
+}
+
+export interface IncidentReadinessInfo {
+  readiness_state: "ready" | "unready" | "degraded";
+  current_worker_cycle: number;
+  last_database_check: {
+    status: HealthState;
+    latency_ms: number;
+    timestamp: string;
+  };
+  last_successful_ingestion: Record<string, string | null>;
+  last_successful_pipeline: string | null;
+  last_successful_synthesis: string | null;
+}
+
 export interface OpsOverview {
   status: HealthState;
   timestamp: string;
@@ -104,6 +141,12 @@ export interface OpsOverview {
     last_run_time: string | null;
     next_scheduled_run: string | null;
     interval_hours: number;
+  };
+  incident_readiness?: IncidentReadinessInfo;
+  alerts_summary?: {
+    active_count: number;
+    resolved_count: number;
+    last_evaluation_time: string | null;
   };
   recent_pipeline_runs: OpsPipelineRun[];
   pipeline_summary: {

@@ -1,4 +1,5 @@
 import {
+  AlertSummary,
   CandidateTopic,
   OpsOverview,
   OpsPipelineMetrics,
@@ -153,3 +154,18 @@ export async function triggerOpsReprocessTopic(slug: string, apiKey?: string): P
     headers,
   });
 }
+
+export async function getOpsAlerts(autoEvaluate?: boolean): Promise<AlertSummary> {
+  const query = autoEvaluate ? "?auto_evaluate=true" : "";
+  return fetchJson<AlertSummary>(`/ops/alerts${query}`);
+}
+
+export async function triggerOpsAlertEvaluate(apiKey?: string): Promise<AlertSummary> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["X-Ops-Key"] = apiKey;
+  return fetchJson<AlertSummary>("/ops/alerts/evaluate", {
+    method: "POST",
+    headers,
+  });
+}
+

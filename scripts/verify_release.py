@@ -48,6 +48,7 @@ def verify_project_files(root: Path) -> bool:
         "backend/app/database/models.py",
         "backend/app/core/security.py",
         "backend/app/core/telemetry.py",
+        "backend/app/core/alerting.py",
         "backend/app/api/topics.py",
         "backend/app/api/ops.py",
         "backend/app/api/workers.py",
@@ -68,6 +69,9 @@ def verify_project_files(root: Path) -> bool:
         "frontend/lib/api.ts",
         "frontend/lib/types.ts",
         "frontend/lib/utils.ts",
+        # Scripts & Readiness
+        "scripts/verify_release.py",
+        "scripts/incident_readiness.py",
         # CI & Orchestration
         "docker-compose.yml",
         ".github/workflows/ci.yml",
@@ -133,6 +137,7 @@ def verify_backend_imports_and_probes(root: Path) -> bool:
         "app.database.models",
         "app.core.security",
         "app.core.telemetry",
+        "app.core.alerting",
         "app.ingestion.google_news",
         "app.ingestion.reddit",
         "app.ingestion.x",
@@ -190,6 +195,14 @@ def verify_backend_imports_and_probes(root: Path) -> bool:
             log_pass("Operations overview probe /api/ops/overview verified (HTTP 200 OK)")
         else:
             log_fail(f"/api/ops/overview failed with status {resp_ops.status_code}")
+            all_imported = False
+
+        # Test /api/ops/alerts
+        resp_alerts = client.get("/api/ops/alerts")
+        if resp_alerts.status_code == 200:
+            log_pass("Production alerts probe /api/ops/alerts verified (HTTP 200 OK)")
+        else:
+            log_fail(f"/api/ops/alerts failed with status {resp_alerts.status_code}")
             all_imported = False
 
     except Exception as e:

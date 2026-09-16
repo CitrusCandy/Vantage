@@ -58,5 +58,17 @@ X ────────────┘
 5. **LLM Perspective Synthesis**:
    - Extracts core perspective stances, arguments, and representative citations from top clusters.
 
-6. **Frontend Showcase**:
-   - Responsive multi-perspective comparison interface.
+6. **Production Monitoring, Alerting & Incident Readiness**:
+   - **Centralized Alert Manager (`app.core.alerting`)**:
+     - Evaluates system telemetry, database availability, background worker scheduler, source error spikes, pipeline failure rates, and stage latencies.
+     - Severity calculation: `info`, `warning`, `critical`.
+     - Deduplication & Cooldown: Consecutive occurrences increment `occurrence_count` and update `last_seen` without spamming duplicate alert instances.
+     - Automatic Resolution: Resolves active alerts once underlying metrics normalize and records to `resolved_history`.
+   - **Operational Incident Checklist (`scripts/incident_readiness.py`)**:
+     - Verifies health probes (`/health`, `/ready`), DB ping latency, worker state, source freshness, pipeline telemetry, and runs an alert evaluation pass.
+     - Returns exit code 0 when nominal; non-zero if critical failures are present.
+
+7. **Frontend Showcase & Operations Dashboard**:
+   - Classy multi-perspective showcase interface.
+   - Operations dashboard (`/ops`) featuring live telemetry, active alerts panel with severity indicators, incident status cards, and manual evaluation triggers.
+

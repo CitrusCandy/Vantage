@@ -4,13 +4,17 @@ import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import {
   Activity,
+  AlertOctagon,
   AlertTriangle,
   ArrowLeft,
+  Bell,
+  BellRing,
   CheckCircle,
   Clock,
   Cpu,
   Database,
   Globe,
+  Info,
   Key,
   Layers,
   Pause,
@@ -18,6 +22,7 @@ import {
   RefreshCw,
   Server,
   Shield,
+  ShieldCheck,
   Sliders,
   TrendingUp,
   XCircle,
@@ -25,15 +30,20 @@ import {
 } from "lucide-react";
 
 import {
+  getOpsAlerts,
   getOpsOverview,
   getOpsPipelineMetrics,
   getOpsSourceHealth,
   getOpsWorkerMetrics,
+  triggerOpsAlertEvaluate,
   triggerOpsRefreshTopic,
   triggerOpsReprocessTopic,
   triggerOpsTrending,
 } from "@/lib/api";
 import {
+  AlertInstance,
+  AlertSeverity,
+  AlertSummary,
   HealthState,
   OpsOverview,
   OpsPipelineMetrics,
@@ -47,6 +57,7 @@ export default function OperationsPage() {
   const [pipelineMetrics, setPipelineMetrics] = useState<OpsPipelineMetrics | null>(null);
   const [sourceHealth, setSourceHealth] = useState<OpsSourceHealth | null>(null);
   const [workerMetrics, setWorkerMetrics] = useState<OpsWorkerMetrics | null>(null);
+  const [alertsSummary, setAlertsSummary] = useState<AlertSummary | null>(null);
 
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
@@ -54,6 +65,7 @@ export default function OperationsPage() {
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
   const [opsApiKey, setOpsApiKey] = useState<string>("");
   const [showKeyInput, setShowKeyInput] = useState<boolean>(false);
+  const [showAlertHistory, setShowAlertHistory] = useState<boolean>(false);
 
   // Control action state
   const [reprocessSlug, setReprocessSlug] = useState<string>("");
@@ -63,22 +75,42 @@ export default function OperationsPage() {
   const loadAllTelemetry = async () => {
     try {
       setIsRefreshing(true);
-      const [ov, pm, sh, wm] = await Promise.all([
+      const [ov, pm, sh, wm, al] = await Promise.all([
         getOpsOverview(),
         getOpsPipelineMetrics(),
         getOpsSourceHealth(),
         getOpsWorkerMetrics(),
+        getOpsAlerts(),
       ]);
       setOverview(ov);
       setPipelineMetrics(pm);
       setSourceHealth(sh);
       setWorkerMetrics(wm);
+      setAlertsSummary(al);
       setLastUpdated(new Date());
     } catch (err: any) {
       console.error("Failed to load operations telemetry:", err);
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
+    }
+  };
+
+  const handleEvaluateAlerts = async () => {
+    setIsActionRunning(true);
+    setActionMessage(null);
+    try {
+      const res = await triggerOpsAlertEvaluate(opsApiKey);
+      setAlertsSummary(res);
+      setActionMessage({
+        type: "success",
+        text: `Alert evaluation cycle completed. ${res.active_count} active alerts, ${res.resolved_count} resolved.`,
+      });
+      loadAllTelemetry();
+    } catch (err: any) {
+      setActionMessage({ type: "error", text: err.message || "Failed to trigger alert evaluation" });
+    } finally {
+      setIsActionRunning(false);
     }
   };
 
@@ -166,6 +198,33 @@ export default function OperationsPage() {
     }
   };
 
+  const getSeverityBadge = (severity: AlertSeverity | string) => {
+    switch (severity) {
+      case "critical":
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider bg-rose-500/20 text-rose-300 border border-rose-500/30 shadow-sm shadow-rose-500/20">
+            <AlertOctagon className="w-3 h-3 text-rose-400" />
+            Critical
+          </span>
+        );
+      case "warning":
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider bg-amber-500/20 text-amber-300 border border-amber-500/30 shadow-sm shadow-amber-500/20">
+            <AlertTriangle className="w-3 h-3 text-amber-400" />
+            Warning
+          </span>
+        );
+      case "info":
+      default:
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider bg-blue-500/20 text-blue-300 border border-blue-500/30">
+            <Info className="w-3 h-3 text-blue-400" />
+            Info
+          </span>
+        );
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 py-8 px-4 sm:px-6 lg:px-8">
       <div className="max-w-7xl mx-auto space-y-8">
@@ -190,12 +249,21 @@ export default function OperationsPage() {
               Operations & Observability Control
             </h1>
             <p className="text-xs sm:text-sm text-slate-400 mt-1">
-              Internal system telemetry, pipeline latency breakdown, source health status, and operational controls.
+              Internal system telemetry, alerts & incident readiness, source health status, and operational controls.
             </p>
           </div>
 
           {/* Action Bar */}
           <div className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={handleEvaluateAlerts}
+              disabled={isActionRunning}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-surface-light text-slate-300 border-surface-border hover:text-white hover:border-indigo-500/40 disabled:opacity-50 transition-all"
+            >
+              <BellRing className="w-3.5 h-3.5 text-indigo-400" />
+              Evaluate Alerts
+            </button>
+
             <button
               onClick={() => setShowKeyInput(!showKeyInput)}
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
@@ -364,7 +432,175 @@ export default function OperationsPage() {
           </div>
         </div>
 
-        {/* 2. Middle Section: Ingestion Source Health & Pipeline Metrics */}
+        {/* 2. Production Alerting & Incident Readiness */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Active Alerts & Resolved History (2 cols) */}
+          <div className="lg:col-span-2 p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Bell className="w-5 h-5 text-indigo-400" />
+                <h2 className="text-base font-semibold text-white">Production Alerts Engine</h2>
+                {alertsSummary && alertsSummary.active_count > 0 && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                    {alertsSummary.active_count} Active
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowAlertHistory(!showAlertHistory)}
+                  className="text-xs text-indigo-400 hover:text-indigo-300 underline font-medium"
+                >
+                  {showAlertHistory ? "Show Active Alerts" : `View History (${alertsSummary?.resolved_count || 0})`}
+                </button>
+              </div>
+            </div>
+
+            {!showAlertHistory ? (
+              <div className="space-y-3">
+                {alertsSummary && alertsSummary.active_alerts.length > 0 ? (
+                  alertsSummary.active_alerts.map((alert) => (
+                    <div
+                      key={alert.id}
+                      className="p-4 rounded-xl bg-slate-900/80 border border-rose-500/20 shadow-sm shadow-rose-500/5 space-y-2"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          {getSeverityBadge(alert.severity)}
+                          <span className="px-2 py-0.5 rounded text-[11px] font-mono bg-slate-800 text-slate-300 border border-white/5">
+                            {alert.component}
+                          </span>
+                        </div>
+                        <span className="text-[11px] font-mono text-slate-400">
+                          {alert.occurrence_count > 1 ? `${alert.occurrence_count} occurrences` : "1 occurrence"}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-200">{alert.message}</p>
+                      <div className="flex items-center justify-between text-[10px] text-slate-500 pt-1 border-t border-white/[0.04]">
+                        <span>First seen: {formatTimeAgo(alert.first_seen)}</span>
+                        <span>Last trigger: {formatTimeAgo(alert.last_seen)}</span>
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="p-6 rounded-xl bg-slate-900/40 border border-white/[0.04] text-center space-y-2">
+                    <ShieldCheck className="w-8 h-8 text-emerald-400 mx-auto opacity-80" />
+                    <p className="text-xs font-semibold text-slate-200">No Active Alerts</p>
+                    <p className="text-[11px] text-slate-400 max-w-md mx-auto">
+                      All evaluated operational invariants (DB connectivity, worker cycle, source error rates, pipeline latency, LLM endpoints) are nominal.
+                    </p>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {alertsSummary && alertsSummary.resolved_alerts.length > 0 ? (
+                  alertsSummary.resolved_alerts.map((alert) => (
+                    <div
+                      key={alert.id + (alert.resolved_at || "")}
+                      className="p-3.5 rounded-xl bg-slate-900/40 border border-white/[0.04] space-y-1.5 opacity-80 hover:opacity-100 transition-opacity"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-semibold uppercase bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                            Resolved
+                          </span>
+                          <span className="text-xs font-mono text-slate-300">{alert.component}</span>
+                        </div>
+                        <span className="text-[10px] font-mono text-slate-500">
+                          Resolved {alert.resolved_at ? formatTimeAgo(alert.resolved_at) : ""}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-400">{alert.message}</p>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-xs text-slate-500 py-6 text-center">
+                    No resolved alert history recorded in current session.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Incident Readiness Context (1 col) */}
+          <div className="p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-5 h-5 text-emerald-400" />
+                <h2 className="text-base font-semibold text-white">Incident Readiness</h2>
+              </div>
+              <span className="text-[11px] font-mono text-slate-400">
+                {overview?.incident_readiness?.readiness_state === "ready" ? "READY" : "DEGRADED"}
+              </span>
+            </div>
+
+            <div className="space-y-2.5 text-xs">
+              <div className="p-3 rounded-xl bg-slate-900/60 border border-white/[0.04] flex items-center justify-between">
+                <span className="text-slate-400">Readiness Probe:</span>
+                <span className="font-semibold text-emerald-400 flex items-center gap-1">
+                  <CheckCircle className="w-3.5 h-3.5" />
+                  {overview?.incident_readiness?.readiness_state?.toUpperCase() || "READY"}
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl bg-slate-900/60 border border-white/[0.04] flex items-center justify-between">
+                <span className="text-slate-400">Current Worker Cycle:</span>
+                <span className="font-mono text-slate-200">
+                  #{overview?.incident_readiness?.current_worker_cycle || overview?.worker?.total_runs || 0}
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl bg-slate-900/60 border border-white/[0.04] flex items-center justify-between">
+                <span className="text-slate-400">Last Database Ping:</span>
+                <span className="font-mono text-emerald-400">
+                  {overview?.incident_readiness?.last_database_check?.latency_ms || overview?.database?.latency_ms || 0} ms
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl bg-slate-900/60 border border-white/[0.04] space-y-1.5">
+                <span className="text-slate-400 block">Last Source Successes:</span>
+                <div className="space-y-1 text-[11px]">
+                  <div className="flex justify-between font-mono">
+                    <span className="text-slate-500">Google News:</span>
+                    <span className="text-slate-300">
+                      {overview?.incident_readiness?.last_successful_ingestion?.google_news
+                        ? formatTimeAgo(overview.incident_readiness.last_successful_ingestion.google_news)
+                        : "Nominal"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between font-mono">
+                    <span className="text-slate-500">Reddit:</span>
+                    <span className="text-slate-300">
+                      {overview?.incident_readiness?.last_successful_ingestion?.reddit
+                        ? formatTimeAgo(overview.incident_readiness.last_successful_ingestion.reddit)
+                        : "Nominal"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between font-mono">
+                    <span className="text-slate-500">X (Scraper):</span>
+                    <span className="text-slate-300">
+                      {overview?.incident_readiness?.last_successful_ingestion?.x
+                        ? formatTimeAgo(overview.incident_readiness.last_successful_ingestion.x)
+                        : "Nominal"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-3 rounded-xl bg-slate-900/60 border border-white/[0.04] flex items-center justify-between">
+                <span className="text-slate-400">Last Pipeline Run:</span>
+                <span className="font-mono text-slate-300">
+                  {overview?.incident_readiness?.last_successful_pipeline
+                    ? formatTimeAgo(overview.incident_readiness.last_successful_pipeline)
+                    : "No runs"}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 3. Middle Section: Ingestion Source Health & Pipeline Metrics */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Source Health Matrix */}
           <div className="p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-5">

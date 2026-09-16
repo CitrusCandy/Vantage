@@ -146,6 +146,19 @@ def mask_secret(secret: Optional[str], visible_chars: int = 4) -> str:
     return f"{sec_str[:visible_chars]}...{sec_str[-visible_chars:]}"
 
 
+def mask_sensitive_data(text_val: Optional[str]) -> str:
+    """Mask tokens, passwords, cookies, API keys, and connection strings from arbitrary text."""
+    if not text_val or not isinstance(text_val, str):
+        return ""
+    # Mask Bearer tokens, passwords, secrets, keys
+    masked = re.sub(r"(?i)(bearer\s+)[a-zA-Z0-9_\-\.]{8,}", r"\1[REDACTED]", text_val)
+    masked = re.sub(r"(?i)(token|password|secret|key|cookie)[=:\s]+['\"]?[a-zA-Z0-9_\-\.]{8,}['\"]?", r"\1: [REDACTED]", masked)
+    masked = re.sub(r"sk-[a-zA-Z0-9_\-]{20,}", "[REDACTED_API_KEY]", masked)
+    masked = re.sub(r"ghp_[a-zA-Z0-9]{20,}", "[REDACTED_TOKEN]", masked)
+    masked = re.sub(r"postgres(?:ql)?://([^:]+):([^@]+)@", r"postgresql://\1:****@", masked)
+    return masked
+
+
 def get_allowed_cors_origins() -> List[str]:
     """Parse CORS allowed origins from environment variable or return secure defaults."""
     raw = os.getenv("CORS_ORIGINS", "").strip()

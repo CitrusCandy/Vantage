@@ -161,6 +161,18 @@ Services will be accessible at:
 | `MIN_TRENDING_SCORE_REFRESH` | Optional | `0.20` | Minimum score threshold for automated ML refresh |
 | `STAGNANT_HOURS_THRESHOLD` | Optional | `48.0` | Inactivity threshold before marking topic stagnant |
 | `DECAY_HALF_LIFE_HOURS` | Optional | `24.0` | Half-life constant for exponential score decay |
+| `ENABLE_ALERT_EVALUATION` | Optional | `true` | Master switch for internal production alerting engine |
+| `ALERT_WORKER_ENABLED` | Optional | `true` | Enable background scheduler alive/stale checks |
+| `ALERT_COOLDOWN_SECONDS` | Optional | `300` | Alert cooldown & deduplication window (seconds) |
+| `ALERT_DB_LATENCY_THRESHOLD_MS` | Optional | `2000.0` | Database ping latency warning threshold (ms) |
+| `ALERT_WORKER_GRACE_PERIOD_SECONDS` | Optional | `1800` | Worker execution grace period beyond cadence (seconds) |
+| `ALERT_SOURCE_STALE_HOURS` | Optional | `24.0` | Inactive enabled source stale threshold (hours) |
+| `ALERT_PIPELINE_FAILURE_THRESHOLD` | Optional | `2` | Recent pipeline failure count threshold |
+| `ALERT_PIPELINE_LATENCY_THRESHOLD_MS` | Optional | `30000.0` | Pipeline execution high latency threshold (ms) |
+| `ALERT_SOURCE_FAILURE_THRESHOLD` | Optional | `3` | Source scraping consecutive failure threshold |
+| `ALERT_LLM_FAILURE_THRESHOLD` | Optional | `2` | Perspective LLM provider failure threshold |
+| `ALERT_X_FAILURE_THRESHOLD` | Optional | `3` | X scraper consecutive failure threshold |
+| `ALERT_MAX_RESOLVED_HISTORY` | Optional | `50` | Maximum resolved alerts kept in in-memory history |
 | `NEXT_PUBLIC_API_URL` | Optional (Frontend) | `http://localhost:8000/api` | Base URL for FastAPI backend proxy |
 
 ---
@@ -171,7 +183,9 @@ Services will be accessible at:
 - `POST /api/topics` — Create topic query.
 - `GET /api/topics/{slug}` — Retrieve topic and its synthesized perspectives.
 - `POST /api/topics/{slug}/run-pipeline` — Execute full end-to-end flow: Ingestion $\rightarrow$ Staging $\rightarrow$ Merge $\rightarrow$ HDBSCAN Clustering $\rightarrow$ LLM Synthesis.
-- `GET /api/ops/overview` — High-level operational health and system overview.
+- `GET /api/ops/overview` — High-level operational health, incident readiness timestamps, and alert counts.
+- `GET /api/ops/alerts` — Active alerts, severity (`info`, `warning`, `critical`), occurrence counts, and resolved history.
+- `POST /api/ops/alerts/evaluate` — Trigger on-demand alert evaluation pass (protected by `X-Ops-Key`).
 - `GET /api/ops/pipeline-metrics` — Multi-stage pipeline latency telemetry, median durations, and slowest stages.
 - `GET /api/ops/source-health` — Fault-isolated reliability status for Google News, Reddit, X, and OpenAI.
 - `GET /api/workers/status` — Inspect background scheduler status.
@@ -179,19 +193,62 @@ Services will be accessible at:
 
 ---
 
-## Automated Quality Gates & Local Release Verification
+## Production Monitoring, Alerting & Incident Response
 
-Before pushing changes or deploying to production, execute the automated release verification gate:
+### 1. Alert Evaluation Rules & Severities
+
+| Rule Name | Component | Severity | Condition |
+| :--- | :--- | :--- | :--- |
+| `database_unavailable` | `database` | **CRITICAL** | Database connection ping (`SELECT 1`) fails or times out |
+| `database_high_latency` | `database` | **WARNING** | Database ping latency exceeds `ALERT_DB_LATENCY_THRESHOLD_MS` |
+| `worker_stopped` | `worker` | **CRITICAL / WARNING** | Scheduler crashed with error (Critical) or inactive (Warning) |
+| `worker_stale` | `worker` | **WARNING** | Worker last run exceeds `(interval * 3600) + grace_period` |
+| `source_failure_spike` | `source:<name>` | **CRITICAL / WARNING** | Enabled source failures exceed `ALERT_SOURCE_FAILURE_THRESHOLD` |
+| `source_stale` | `source:<name>` | **WARNING** | Enabled source has no successful ingestion within `ALERT_SOURCE_STALE_HOURS` |
+| `llm_repeated_failures` | `llm:openai` | **CRITICAL** | OpenAI / LLM perspective synthesis failures exceed threshold |
+| `x_scraper_repeated_failures` | `source:x` | **WARNING** | X scraper consecutive failures/timeouts exceed threshold |
+| `pipeline_failure_spike` | `pipeline` | **CRITICAL** | Recent pipeline runs have $\ge 2$ failures in last 5 runs |
+| `pipeline_high_latency` | `pipeline` | **WARNING** | Pipeline execution duration exceeds `ALERT_PIPELINE_LATENCY_THRESHOLD_MS` |
+
+### 2. Cooldown & Deduplication Behavior
+
+- Consecutive failures for the same `(rule_name, component)` do not flood logs or UI with duplicate records.
+- Instead, the existing active alert updates `last_seen`, increments `occurrence_count`, and refreshes metadata.
+- When metrics normalize on subsequent evaluation passes, the alert is automatically marked `status = "resolved"`, stamped with `resolved_at`, and archived into `resolved_history`.
+
+### 3. How to Manually Evaluate Alerts
+
+- **Via Operations UI**: Navigate to `/ops` and click **Evaluate Alerts** (uses configured `X-Ops-Key`).
+- **Via API**:
+  ```bash
+  curl -X POST http://localhost:8000/api/ops/alerts/evaluate \
+    -H "X-Ops-Key: your_admin_ops_key_here"
+  ```
+
+### 4. How to Safely Disable Alerts
+
+- Set `ENABLE_ALERT_EVALUATION=false` to globally disable alert evaluation.
+- Set `ALERT_WORKER_ENABLED=false` to suppress worker stoppage alerts in environments where workers run out-of-process.
+
+---
+
+## Automated Quality Gates & Incident Readiness Checklist
+
+Before pushing changes or deploying to production, execute the automated verification gates:
 
 ```bash
 # 1. Run release verification gate (checks files, env templates, secret scan, imports, probes)
 python scripts/verify_release.py
 
-# 2. Run complete backend test suite (100% offline, deterministic)
+# 2. Run incident readiness checklist (probes, database ping, worker state, source freshness, alerts pass)
+python scripts/incident_readiness.py
+
+# 3. Run complete backend test suite (100% offline, deterministic)
 pytest backend/tests/ -v
 
-# 3. Verify frontend production compilation
+# 4. Verify frontend production compilation
 cd frontend && npm run build
 ```
+
 
 
