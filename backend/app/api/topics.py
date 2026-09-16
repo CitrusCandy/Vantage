@@ -107,6 +107,36 @@ def list_topics(
 
 
 @router.get(
+    "/trending",
+    response_model=List[TopicResponse],
+    summary="Get top trending topics",
+)
+def get_trending_topics(
+    limit: int = Query(
+        default=10,
+        ge=1,
+        le=100,
+        description="Maximum number of trending topics to return",
+    ),
+    min_score: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Minimum trending score threshold",
+    ),
+    db: Session = Depends(get_db),
+):
+    """Retrieve topics sorted by trending_score descending with optional minimum score filtering."""
+    return (
+        db.query(Topic)
+        .filter(Topic.trending_score >= min_score)
+        .order_by(Topic.trending_score.desc(), Topic.updated_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+@router.get(
     "/{slug}",
     response_model=TopicDetailResponse,
     summary="Get a topic by slug",
