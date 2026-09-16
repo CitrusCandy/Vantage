@@ -10,10 +10,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install system runtime dependencies
+# Install system runtime dependencies (including PostgreSQL client tools for backup/restore)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libpq-dev \
+    postgresql-client \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
@@ -25,8 +26,9 @@ RUN pip install --upgrade pip && \
 # Copy backend source code
 COPY . .
 
-# Create non-root system user for security
+# Create non-root system user for security and initialize backup directory
 RUN useradd -m -u 1001 appuser && \
+    mkdir -p /app/backups && \
     chown -R appuser:appuser /app
 USER appuser
 

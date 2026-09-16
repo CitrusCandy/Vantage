@@ -56,3 +56,20 @@ Every HTTP response from FastAPI backend enforces modern security headers:
 
 The CI quality gate and local `scripts/verify_release.py` automatically scan all tracked files for accidental `.env` files, unmasked private keys (`.pem`, `.key`), or OpenAI / GitHub credential patterns before commit or deployment.
 
+---
+
+## 7. Database Backup & Disaster Recovery Security
+
+- **Safe Subprocess Environment Injection**:
+  - `pg_dump` and `pg_restore` execute using `PGPASSWORD` injected strictly via private subprocess `env` dictionaries.
+  - Passwords and connection strings are NEVER passed as command-line arguments (preventing process table inspection via `ps aux`).
+- **Zero Credential Exposure in Records**:
+  - `BackupRecord` stores only metadata (`backup_id`, `filename`, `size_bytes`, `checksum`, `status`, `is_verified`, timestamps).
+  - Database passwords, connection URLs, and filesystem secrets are excluded from database rows, API responses, and logs.
+- **Strict HTTP Restore Blocking**:
+  - Destructive database restoration is intentionally **NOT** exposed via HTTP or REST endpoints.
+  - Restorations must be performed via authenticated CLI sessions with the mandatory `--confirm` flag, preventing accidental overwrite or unauthorized remote invocation.
+- **SHA-256 Integrity Verification**:
+  - In-flight SHA-256 computation ensures that any tampered, incomplete, or corrupted backup file fails verification and is prevented from being marked healthy.
+
+

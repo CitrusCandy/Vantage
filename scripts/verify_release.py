@@ -47,6 +47,8 @@ def verify_project_files(root: Path) -> bool:
         "backend/app/database/database.py",
         "backend/app/database/models.py",
         "backend/app/database/cleanup_ops_history.py",
+        "backend/app/database/backup.py",
+        "backend/app/database/restore.py",
         "backend/app/core/security.py",
         "backend/app/core/telemetry.py",
         "backend/app/core/alerting.py",
@@ -70,9 +72,12 @@ def verify_project_files(root: Path) -> bool:
         "frontend/lib/api.ts",
         "frontend/lib/types.ts",
         "frontend/lib/utils.ts",
+        # Documentation & Disaster Recovery
+        "docs/disaster-recovery.md",
         # Scripts & Readiness
         "scripts/verify_release.py",
         "scripts/incident_readiness.py",
+        "scripts/disaster_recovery_check.py",
         # CI & Orchestration
         "docker-compose.yml",
         ".github/workflows/ci.yml",
@@ -136,6 +141,8 @@ def verify_backend_imports_and_probes(root: Path) -> bool:
     modules_to_test = [
         "app.database.database",
         "app.database.models",
+        "app.database.backup",
+        "app.database.restore",
         "app.core.security",
         "app.core.telemetry",
         "app.core.alerting",

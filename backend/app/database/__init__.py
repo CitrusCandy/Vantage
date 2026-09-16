@@ -12,6 +12,7 @@ from app.database.models import (
     SourceExecution,
     Topic,
     WorkerCycle,
+    BackupRecord,
 )
 
 __all__ = [
@@ -31,5 +32,6 @@ __all__ = [
     "SourceExecution",
     "WorkerCycle",
     "OperationalAlert",
+    "BackupRecord",
 ]
 

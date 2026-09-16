@@ -639,3 +639,97 @@ def trigger_ops_reprocess_topic(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Reprocess failed: {str(e)[:100]}",
         )
+
+
+# ==========================================
+# Database Backup & Disaster Recovery APIs
+# ==========================================
+
+
+@router.get(
+    "/backups",
+    summary="Get recent database backup records, status, and verification state",
+)
+def get_backups(
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return recent backup metadata without exposing database passwords or filesystem secrets."""
+    from app.database.backup import BackupConfig, is_backup_running, list_backups
+
+    backups = list_backups(db=db, limit=limit)
+    cfg = BackupConfig()
+
+    last_success = next((b for b in backups if b.get("status") in ("success", "verified")), None)
+    last_failed = next((b for b in backups if b.get("status") in ("failed", "corrupted")), None)
+
+    return {
+        "status": "success",
+        "backup_enabled": cfg.enabled,
+        "backup_running": is_backup_running(),
+        "total_backups": len(backups),
+        "last_successful_backup": last_success,
+        "last_failed_backup": last_failed,
+        "retention_policy": {
+            "retention_count": cfg.retention_count,
+            "retention_days": cfg.retention_days,
+            "interval_hours": cfg.interval_hours,
+            "compression": cfg.compression,
+            "verify_after_create": cfg.verify_after_create,
+        },
+        "backups": backups,
+    }
+
+
+@router.post(
+    "/backups/create",
+    summary="Trigger immediate logical database backup",
+    dependencies=[Depends(verify_ops_control_access)],
+)
+def trigger_ops_create_backup(
+    dry_run: bool = Query(default=False, description="Simulate backup creation without writing to disk"),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Execute logical database backup with SHA-256 checksum and metadata persistence."""
+    from app.database.backup import BackupConfig, create_backup
+
+    try:
+        cfg = BackupConfig()
+        result = create_backup(db=db, config=cfg, dry_run=dry_run)
+        return {
+            "status": "success",
+            "backup": result,
+        }
+    except Exception as e:
+        logger.error("Ops create backup failed: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Backup creation failed: {str(e)[:120]}",
+        )
+
+
+@router.post(
+    "/backups/verify/{backup_id}",
+    summary="Verify integrity of a specific database backup",
+    dependencies=[Depends(verify_ops_control_access)],
+)
+def trigger_ops_verify_backup(
+    backup_id: str,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Verify backup file existence, non-emptiness, and SHA-256 checksum match."""
+    from app.database.backup import verify_backup
+
+    try:
+        result = verify_backup(backup_id=backup_id, db=db)
+        return {
+            "status": "success",
+            "verification": result,
+        }
+    except Exception as e:
+        logger.error("Ops verify backup failed: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Backup verification failed: {str(e)[:120]}",
+        )
+

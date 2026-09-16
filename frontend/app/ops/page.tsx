@@ -28,6 +28,7 @@ import {
   Shield,
   ShieldCheck,
   Sliders,
+  Terminal,
   TrendingUp,
   XCircle,
   Zap,
@@ -35,21 +36,26 @@ import {
 
 import {
   getOpsAlerts,
+  getOpsBackups,
   getOpsHistory,
   getOpsOverview,
   getOpsPipelineMetrics,
   getOpsSourceHealth,
   getOpsWorkerMetrics,
   triggerOpsAlertEvaluate,
+  triggerOpsCreateBackup,
   triggerOpsRefreshTopic,
   triggerOpsReprocessTopic,
   triggerOpsTrending,
+  triggerOpsVerifyBackup,
 } from "@/lib/api";
 import {
   AlertInstance,
   AlertSeverity,
   AlertSummary,
+  BackupRecordItem,
   HealthState,
+  OpsBackupsResponse,
   OpsHistoryItem,
   OpsHistoryResponse,
   OpsOverview,
@@ -86,6 +92,60 @@ export default function OperationsPage() {
   const [actionMessage, setActionMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [isActionRunning, setIsActionRunning] = useState<boolean>(false);
 
+  // Backup & Disaster Recovery State
+  const [backupsResponse, setBackupsResponse] = useState<OpsBackupsResponse | null>(null);
+  const [isBackupsLoading, setIsBackupsLoading] = useState<boolean>(false);
+  const [isCreatingBackup, setIsCreatingBackup] = useState<boolean>(false);
+  const [verifyingBackupId, setVerifyingBackupId] = useState<string | null>(null);
+
+  const loadBackups = async () => {
+    try {
+      setIsBackupsLoading(true);
+      const res = await getOpsBackups(15);
+      setBackupsResponse(res);
+    } catch (err: any) {
+      console.error("Failed to load backup records:", err);
+    } finally {
+      setIsBackupsLoading(false);
+    }
+  };
+
+  const handleCreateBackup = async (dryRun: boolean = false) => {
+    setIsCreatingBackup(true);
+    setActionMessage(null);
+    try {
+      const res = await triggerOpsCreateBackup(opsApiKey, dryRun);
+      setActionMessage({
+        type: "success",
+        text: dryRun
+          ? "Dry-run backup validation succeeded! Ready for logical dump."
+          : `Backup created successfully! ID: ${res.backup_id} (${res.size_human || res.filename})`,
+      });
+      loadBackups();
+    } catch (err: any) {
+      setActionMessage({ type: "error", text: err.message || "Failed to create database backup" });
+    } finally {
+      setIsCreatingBackup(false);
+    }
+  };
+
+  const handleVerifyBackup = async (backupId: string) => {
+    setVerifyingBackupId(backupId);
+    setActionMessage(null);
+    try {
+      const res = await triggerOpsVerifyBackup(backupId, opsApiKey);
+      setActionMessage({
+        type: "success",
+        text: `Backup ${backupId} verified successfully! SHA-256 integrity check passed.`,
+      });
+      loadBackups();
+    } catch (err: any) {
+      setActionMessage({ type: "error", text: err.message || `Failed to verify backup ${backupId}` });
+    } finally {
+      setVerifyingBackupId(null);
+    }
+  };
+
   const loadAllTelemetry = async () => {
     try {
       setIsRefreshing(true);
@@ -101,6 +161,7 @@ export default function OperationsPage() {
       setSourceHealth(sh);
       setWorkerMetrics(wm);
       setAlertsSummary(al);
+      loadBackups();
       setLastUpdated(new Date());
     } catch (err: any) {
       console.error("Failed to load operations telemetry:", err);
@@ -807,7 +868,233 @@ export default function OperationsPage() {
           </div>
         </div>
 
-        {/* 4. Recent Pipeline Runs Table */}
+        {/* 4. Disaster Recovery & Backup Readiness */}
+        <div className="p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-5 h-5 text-emerald-400" />
+              <div>
+                <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                  Disaster Recovery & Backup Readiness
+                  {backupsResponse && (
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-medium ${
+                        backupsResponse.summary.failed_records === 0 && backupsResponse.summary.successful_records > 0
+                          ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                          : backupsResponse.summary.successful_records === 0
+                          ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                          : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+                      }`}
+                    >
+                      {backupsResponse.summary.failed_records === 0 && backupsResponse.summary.successful_records > 0
+                        ? "HEALTHY"
+                        : backupsResponse.summary.successful_records === 0
+                        ? "INITIALIZING"
+                        : "WARNINGS"}
+                    </span>
+                  )}
+                </h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Automated PostgreSQL logical snapshots, SHA-256 integrity validation, and retention lifecycle.
+                </p>
+              </div>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => handleCreateBackup(true)}
+                disabled={isCreatingBackup || isActionRunning}
+                className="px-3 py-1.5 rounded-xl bg-slate-900 border border-white/10 hover:bg-white/[0.04] text-slate-300 text-xs font-semibold disabled:opacity-40 transition-all"
+                title="Test backup parameters without writing database dump"
+              >
+                Dry-Run Check
+              </button>
+              <button
+                onClick={() => handleCreateBackup(false)}
+                disabled={isCreatingBackup || isActionRunning}
+                className="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold disabled:opacity-40 transition-all shadow-md shadow-emerald-600/20 flex items-center gap-1.5"
+              >
+                <Database className="w-3.5 h-3.5" />
+                {isCreatingBackup ? "Creating Dump..." : "Create Backup Now"}
+              </button>
+              <button
+                onClick={loadBackups}
+                disabled={isBackupsLoading}
+                className="p-1.5 rounded-xl bg-slate-900 border border-white/10 hover:bg-white/[0.04] text-slate-400 transition-all"
+                title="Refresh Backups List"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isBackupsLoading ? "animate-spin text-indigo-400" : ""}`} />
+              </button>
+            </div>
+          </div>
+
+          {/* Backup KPI Summary Grid */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className="p-3.5 rounded-xl bg-slate-900/60 border border-white/[0.04] space-y-1">
+              <span className="text-[11px] text-slate-400 flex items-center gap-1">
+                <Clock className="w-3.5 h-3.5 text-indigo-400" /> Latest Successful Backup
+              </span>
+              <span className="text-sm font-bold text-white font-mono block">
+                {backupsResponse?.summary.latest_successful_backup
+                  ? formatTimeAgo(backupsResponse.summary.latest_successful_backup)
+                  : "No backups recorded"}
+              </span>
+              <span className="text-[10px] text-slate-500 block truncate">
+                {backupsResponse?.summary.latest_successful_backup
+                  ? formatDate(backupsResponse.summary.latest_successful_backup)
+                  : "Scheduler awaiting trigger"}
+              </span>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-900/60 border border-white/[0.04] space-y-1">
+              <span className="text-[11px] text-slate-400 flex items-center gap-1">
+                <CheckCircle className="w-3.5 h-3.5 text-emerald-400" /> Verification Integrity
+              </span>
+              <span className="text-sm font-bold text-emerald-400 font-mono block">
+                {backupsResponse?.summary.verified_records || 0} / {backupsResponse?.summary.total_records || 0} Verified
+              </span>
+              <span className="text-[10px] text-slate-500 block">
+                {backupsResponse?.summary.failed_records || 0} failed dump records
+              </span>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-900/60 border border-white/[0.04] space-y-1">
+              <span className="text-[11px] text-slate-400 flex items-center gap-1">
+                <Database className="w-3.5 h-3.5 text-cyan-400" /> Total Storage Footprint
+              </span>
+              <span className="text-sm font-bold text-white font-mono block">
+                {backupsResponse?.summary.total_size_human || "0 B"}
+              </span>
+              <span className="text-[10px] text-slate-500 block">
+                {backupsResponse?.total_count || 0} snapshots cataloged
+              </span>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-900/60 border border-white/[0.04] space-y-1">
+              <span className="text-[11px] text-slate-400 flex items-center gap-1">
+                <Sliders className="w-3.5 h-3.5 text-amber-400" /> Retention & Schedule
+              </span>
+              <span className="text-sm font-bold text-white font-mono block">
+                Keep {backupsResponse?.config.retention_count || 7} / {backupsResponse?.config.retention_days || 30}d
+              </span>
+              <span className="text-[10px] text-slate-500 block">
+                Cadence: {backupsResponse?.config.backup_interval_hours || 24}h • {backupsResponse?.config.compression ? "gzip" : "raw"}
+              </span>
+            </div>
+          </div>
+
+          {/* Backups Catalog Table */}
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="text-[11px] text-slate-400 border-b border-white/[0.06] uppercase tracking-wider">
+                <tr>
+                  <th className="pb-3 font-medium">Backup ID / Timestamp</th>
+                  <th className="pb-3 font-medium">Filename</th>
+                  <th className="pb-3 font-medium">Size</th>
+                  <th className="pb-3 font-medium">SHA-256 Checksum</th>
+                  <th className="pb-3 font-medium">Integrity State</th>
+                  <th className="pb-3 font-medium text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/[0.04]">
+                {backupsResponse && backupsResponse.backups.length > 0 ? (
+                  backupsResponse.backups.map((b) => (
+                    <tr key={b.backup_id} className="hover:bg-white/[0.02] transition-colors">
+                      <td className="py-3">
+                        <div className="space-y-0.5">
+                          <span className="text-white font-mono font-semibold block text-[11px]">
+                            {b.backup_id}
+                          </span>
+                          <span className="text-slate-500 text-[10px]">
+                            {formatTimeAgo(b.created_at)} ({formatDate(b.created_at)})
+                          </span>
+                        </div>
+                      </td>
+                      <td className="py-3 font-mono text-[11px] text-slate-300">
+                        {b.filename}
+                      </td>
+                      <td className="py-3 font-mono text-cyan-300 font-semibold">
+                        {b.size_human || `${b.size_bytes} B`}
+                      </td>
+                      <td className="py-3">
+                        {b.checksum ? (
+                          <span
+                            className="font-mono text-[10px] text-slate-400 bg-slate-900 px-2 py-0.5 rounded border border-white/[0.06] truncate max-w-[120px] inline-block"
+                            title={`SHA-256: ${b.checksum}`}
+                          >
+                            {b.checksum.slice(0, 12)}...
+                          </span>
+                        ) : (
+                          <span className="text-slate-600 text-[10px]">N/A</span>
+                        )}
+                      </td>
+                      <td className="py-3">
+                        {b.is_verified ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                            <CheckCircle className="w-3 h-3" /> VERIFIED
+                          </span>
+                        ) : (
+                          <button
+                            onClick={() => handleVerifyBackup(b.backup_id)}
+                            disabled={verifyingBackupId === b.backup_id || isActionRunning}
+                            className="px-2 py-0.5 rounded bg-slate-900 border border-white/10 text-slate-300 hover:text-white hover:bg-white/[0.06] text-[10px] font-semibold transition-all flex items-center gap-1"
+                          >
+                            {verifyingBackupId === b.backup_id ? (
+                              <>
+                                <RefreshCw className="w-2.5 h-2.5 animate-spin" /> Verifying...
+                              </>
+                            ) : (
+                              <>
+                                <Shield className="w-2.5 h-2.5" /> Verify Integrity
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </td>
+                      <td className="py-3 text-right">
+                        <span
+                          className={`inline-flex px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                            b.status === "success"
+                              ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                              : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+                          }`}
+                        >
+                          {b.status.toUpperCase()}
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={6} className="py-6 text-center text-slate-500 text-xs">
+                      {isBackupsLoading
+                        ? "Loading database backup records..."
+                        : "No database backups recorded yet. Click 'Create Backup Now' to take an initial snapshot."}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Disaster Recovery / Restore Runbook Banner */}
+          <div className="p-4 rounded-xl bg-slate-900/90 border border-indigo-500/20 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 text-indigo-400 text-xs font-semibold">
+                <Terminal className="w-4 h-4" /> Disaster Recovery Restoration Runbook
+              </div>
+              <p className="text-[11px] text-slate-400">
+                To prevent catastrophic data loss, database restoration is intentionally locked from HTTP APIs and strictly requires authenticated CLI execution.
+              </p>
+            </div>
+            <div className="px-3 py-1.5 rounded-lg bg-black/60 border border-white/10 font-mono text-[11px] text-emerald-400 select-all whitespace-nowrap">
+              python -m app.database.restore --backup &lt;file&gt; --confirm
+            </div>
+          </div>
+        </div>
+
+        {/* 5. Recent Pipeline Runs Table */}
         <div className="p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-5">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">

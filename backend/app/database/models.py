@@ -286,3 +286,44 @@ class OperationalAlert(Base):
             "metadata": self.metadata_json or {},
         }
 
+
+class BackupRecord(Base):
+    __tablename__ = "backup_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    backup_id = Column(String(100), unique=True, index=True, nullable=False)
+    filename = Column(String(255), nullable=False)
+    filepath = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    status = Column(String(50), nullable=False, default="running", index=True)  # running, success, failed, verified, corrupted
+    size_bytes = Column(Integer, default=0, nullable=False)
+    checksum = Column(String(64), nullable=True)  # SHA-256
+    database_name = Column(String(100), nullable=True)
+    schema_version = Column(String(50), default="2.0.0", nullable=False)
+    error_type = Column(Text, nullable=True)
+    is_verified = Column(Boolean, default=False, nullable=False)
+    verified_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_backup_records_status_created", "status", "created_at"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "backup_id": self.backup_id,
+            "filename": self.filename,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "status": self.status,
+            "size_bytes": self.size_bytes,
+            "checksum": self.checksum,
+            "database_name": self.database_name,
+            "schema_version": self.schema_version,
+            "error_type": self.error_type,
+            "is_verified": self.is_verified,
+            "verified_at": self.verified_at.isoformat() if self.verified_at else None,
+        }
+
+

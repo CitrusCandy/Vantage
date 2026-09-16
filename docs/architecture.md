@@ -82,6 +82,13 @@ X ────────────┘
 
 8. **Frontend Showcase & Operations Dashboard**:
    - Classy multi-perspective showcase interface.
-   - Operations dashboard (`/ops`) featuring live telemetry, active alerts panel with severity indicators, incident status cards, manual evaluation triggers, and an audit history log with filtering and pagination.
+   - Operations dashboard (`/ops`) featuring live telemetry, active alerts panel with severity indicators, incident status cards, manual evaluation triggers, disaster recovery management, and an audit history log with filtering and pagination.
+
+9. **Database Backup, Integrity & Disaster Recovery Subsystem**:
+   - **PostgreSQL Logical Dumps**: Automated `pg_dump` creation with configurable compression (`gzip`) and timestamped file nomenclature.
+   - **Metadata Tracking (`backup_records`)**: Persists backup ID, filename, created/completed timestamps, status, size, and SHA-256 checksum with zero credentials/payloads stored in DB.
+   - **Integrity Verification**: Automatic in-flight SHA-256 computation and file header validation preventing corrupt snapshots from being marked healthy.
+   - **Retention Lifecycle**: Prunes expired backup files from storage and updates DB catalog according to `BACKUP_RETENTION_COUNT` and `BACKUP_RETENTION_DAYS`.
+   - **Restoration Tooling**: Safe, verified CLI restoration (`python -m app.database.restore --confirm`) with explicit HTTP-endpoint isolation for maximum disaster protection.
 
 

@@ -255,3 +255,46 @@ export interface OpsHistoryResponse {
   items: OpsHistoryItem[];
 }
 
+export interface BackupRecordItem {
+  backup_id: string;
+  filename: string;
+  created_at: string;
+  completed_at?: string | null;
+  status: "success" | "failed" | "in_progress" | string;
+  is_verified: boolean;
+  size_bytes: number;
+  size_human?: string;
+  checksum?: string | null;
+  database_name?: string | null;
+  schema_version?: string | null;
+  error_type?: string | null;
+  verified_at?: string | null;
+  verification_error?: string | null;
+}
+
+export interface OpsBackupsResponse {
+  status: string;
+  total_count: number;
+  config: {
+    enabled: boolean;
+    retention_count: number;
+    retention_days: number;
+    compression: boolean;
+    verify_after_create: boolean;
+    backup_interval_hours: number;
+  };
+  summary: {
+    total_records: number;
+    successful_records: number;
+    failed_records: number;
+    verified_records: number;
+    latest_backup_time: string | null;
+    latest_successful_backup: string | null;
+    latest_failed_backup: string | null;
+    latest_backup_age_seconds: number | null;
+    total_size_bytes: number;
+    total_size_human: string;
+  };
+  backups: BackupRecordItem[];
+}
+

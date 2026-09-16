@@ -254,6 +254,44 @@ Use `--dry-run` to inspect candidate row counts without deleting.
 
 ---
 
+## Database Backup, Integrity & Disaster Recovery
+
+For complete disaster recovery runbooks, RPO/RTO parameters, and test restore workflows, refer to [`docs/disaster-recovery.md`](docs/disaster-recovery.md).
+
+### 1. Backup CLI Commands
+
+```bash
+# Create a logical PostgreSQL dump (with auto-compression & SHA-256 checksum)
+python -m app.database.backup --create
+
+# Dry-run safety inspection (validates parameters and paths without writing dump)
+python -m app.database.backup --create --dry-run
+
+# List cataloged database backups
+python -m app.database.backup --list
+
+# Verify integrity of a specific backup snapshot
+python -m app.database.backup --verify vantage_backup_20260916_205500
+
+# Run retention pruning lifecycle
+python -m app.database.backup --cleanup --retention-count 7 --retention-days 30
+```
+
+### 2. Safe CLI Restoration (HTTP-Disabled)
+
+> [!CAUTION]
+> Destructive database restores are intentionally **BLOCKED** from HTTP endpoints to prevent accidental production overwrite. Restorations strictly require authenticated CLI access with the explicit `--confirm` flag.
+
+```bash
+# Restore a verified backup dump into target database
+python -m app.database.restore --backup backups/vantage_backup_20260916_205500.sql.gz --confirm
+
+# Dry-run pre-flight validation
+python -m app.database.restore --backup backups/vantage_backup_20260916_205500.sql.gz --dry-run
+```
+
+---
+
 ## Automated Quality Gates & Incident Readiness Checklist
 
 Before pushing changes or deploying to production, execute the automated verification gates:
@@ -265,10 +303,13 @@ python scripts/verify_release.py
 # 2. Run incident readiness checklist (probes, database ping, worker state, source freshness, alerts pass)
 python scripts/incident_readiness.py
 
-# 3. Run complete backend test suite (100% offline, deterministic)
+# 3. Run disaster recovery & backup readiness checklist
+python scripts/disaster_recovery_check.py
+
+# 4. Run complete backend test suite (100% offline, deterministic)
 pytest backend/tests/ -v
 
-# 4. Verify frontend production compilation
+# 5. Verify frontend production compilation
 cd frontend && npm run build
 ```
 

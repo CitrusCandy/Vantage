@@ -22,6 +22,10 @@ class BackgroundScheduler:
         self.last_run_result: Optional[Dict[str, Any]] = None
         self.last_error: Optional[str] = None
         self.total_runs: int = 0
+        self.last_backup_time: Optional[datetime] = None
+        self.last_backup_status: Optional[str] = None
+        self.last_backup_error: Optional[str] = None
+        self.total_backups: int = 0
 
     @property
     def is_running(self) -> bool:
@@ -55,6 +59,41 @@ class BackgroundScheduler:
         if self._thread:
             self._thread.join(timeout=timeout_seconds)
             logger.info("BackgroundScheduler stopped gracefully.")
+
+    def run_scheduled_backup(self) -> Optional[Dict[str, Any]]:
+        """Execute a scheduled database backup with fail-soft isolation."""
+        try:
+            from app.database.backup import BackupConfig, acquire_backup_lock, release_backup_lock, create_backup, prune_backups
+            config = BackupConfig()
+            if not config.enabled:
+                return None
+
+            if not acquire_backup_lock():
+                logger.warning("Scheduled backup skipped: another backup job is currently in progress")
+                return None
+
+            try:
+                logger.info("Starting scheduled database backup")
+                res = create_backup(config=config)
+                # Run retention cleanup
+                prune_backups(config=config)
+                
+                with self._lock:
+                    self.last_backup_time = datetime.utcnow()
+                    self.last_backup_status = res.get("status", "unknown")
+                    self.last_backup_error = res.get("error_type")
+                    self.total_backups += 1
+                return res
+            finally:
+                release_backup_lock()
+        except Exception as e:
+            err_msg = str(e)
+            logger.error("Fail-soft scheduled backup error: %s", err_msg)
+            with self._lock:
+                self.last_backup_time = datetime.utcnow()
+                self.last_backup_status = "failed"
+                self.last_backup_error = err_msg[:255]
+            return None
 
     def trigger_now(
         self,
@@ -151,12 +190,18 @@ class BackgroundScheduler:
     def _run_loop(self, auto_discover: bool, run_immediately: bool) -> None:
         """Main loop executed by the background thread."""
         interval_seconds = max(10.0, self.config.worker_interval_hours * 3600.0)
+        from app.database.backup import BackupConfig
+        backup_cfg = BackupConfig()
+        backup_interval_seconds = max(60.0, backup_cfg.interval_hours * 3600.0)
+        last_backup_check = time.time()
 
         if run_immediately:
             try:
                 self.trigger_now(auto_discover=auto_discover)
             except Exception as e:
                 logger.error("Error in initial scheduler execution: %s", str(e))
+            if backup_cfg.enabled:
+                self.run_scheduled_backup()
 
         while not self._stop_event.is_set():
             # Wait with frequent checks to allow responsive termination
@@ -165,6 +210,11 @@ class BackgroundScheduler:
             while elapsed < interval_seconds and not self._stop_event.is_set():
                 time.sleep(sleep_step)
                 elapsed += sleep_step
+
+                # Periodic check for scheduled backup
+                if time.time() - last_backup_check >= backup_interval_seconds:
+                    last_backup_check = time.time()
+                    self.run_scheduled_backup()
 
             if self._stop_event.is_set():
                 break
@@ -189,6 +239,12 @@ class BackgroundScheduler:
             "worker_interval_hours": self.config.worker_interval_hours,
             "last_error": self.last_error,
             "last_run_result": self.last_run_result,
+            "backup_scheduler": {
+                "total_backups": self.total_backups,
+                "last_backup_time": self.last_backup_time.isoformat() if self.last_backup_time else None,
+                "last_backup_status": self.last_backup_status,
+                "last_backup_error": self.last_backup_error,
+            },
         }
 
 

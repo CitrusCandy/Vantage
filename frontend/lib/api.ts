@@ -193,4 +193,27 @@ export async function getOpsHistory(params?: {
   return fetchJson<import("./types").OpsHistoryResponse>(`/ops/history${qs}`);
 }
 
+export async function getOpsBackups(limit: number = 20): Promise<import("./types").OpsBackupsResponse> {
+  return fetchJson<import("./types").OpsBackupsResponse>(`/ops/backups?limit=${limit}`);
+}
+
+export async function triggerOpsCreateBackup(apiKey?: string, dryRun?: boolean): Promise<any> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["X-Ops-Key"] = apiKey;
+  const qs = dryRun ? "?dry_run=true" : "";
+  return fetchJson(`/ops/backups/create${qs}`, {
+    method: "POST",
+    headers,
+  });
+}
+
+export async function triggerOpsVerifyBackup(backupId: string, apiKey?: string): Promise<any> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["X-Ops-Key"] = apiKey;
+  return fetchJson(`/ops/backups/verify/${encodeURIComponent(backupId)}`, {
+    method: "POST",
+    headers,
+  });
+}
+
 
