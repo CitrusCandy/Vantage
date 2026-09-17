@@ -364,10 +364,3 @@ pytest backend/tests/ -v
 # 5. Verify frontend production compilation
 cd frontend && npm run build
 ```
-
-
-
-
-
-
-
