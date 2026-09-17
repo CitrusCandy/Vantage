@@ -179,7 +179,7 @@ class SLOManager:
 
     def __init__(self, definitions: Optional[Dict[str, SLODefinition]] = None):
         self.definitions = definitions or STANDARD_SLOS.copy()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._history: List[SLIEvaluation] = []
         self._max_history = 500
 

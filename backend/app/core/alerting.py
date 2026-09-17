@@ -122,7 +122,7 @@ class AlertManager:
     """Thread-safe centralized alert evaluation engine with deduplication, cooldown, flapping suppression, and lifecycle tracking."""
 
     def __init__(self, config: Optional[AlertConfig] = None):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.config = config or AlertConfig()
         self.active_alerts: Dict[str, AlertInstance] = {}
         self.resolved_history: deque = deque(maxlen=self.config.max_resolved_history)
@@ -469,7 +469,7 @@ class AlertManager:
         # -------------------------------------------------------------
         # 5. Circuit Breaker States
         # -------------------------------------------------------------
-        cb_states = circuit_registry.get_all_states()
+        cb_states = circuit_registry.get_all_status()
         for cb_name, cb_info in cb_states.items():
             if cb_info.get("state") == "OPEN":
                 self._record_firing_alert(
