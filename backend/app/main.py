@@ -1,11 +1,24 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+import logging
+import os
+import time
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.api.ops import router as ops_router
 from app.api.topics import router as topics_router
 from app.api.workers import router as workers_router
+from app.core.metrics import platform_metrics
+from app.core.security import get_allowed_cors_origins, mask_sensitive_data
+from app.core.slo import slo_manager
 from app.database.database import Base, engine
+
+logger = logging.getLogger("app.main")
+http_logger = logging.getLogger("app.http")
+
+# Maximum permitted HTTP request payload size (2MB)
+MAX_REQUEST_BODY_SIZE = 2 * 1024 * 1024
 
 
 @asynccontextmanager
@@ -14,7 +27,7 @@ async def lifespan(app: FastAPI):
     try:
         Base.metadata.create_all(bind=engine)
     except Exception as e:
-        logging.getLogger("app.main").warning("Database startup init skipped: %s", e)
+        logger.warning("Database startup init skipped: %s", mask_sensitive_data(str(e)))
     yield
 
 
@@ -25,7 +38,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-from app.core.security import get_allowed_cors_origins
 
 # Enable secure CORS for frontend client communication
 allowed_origins = get_allowed_cors_origins()
@@ -34,18 +46,17 @@ app.add_middleware(
     allow_origins=allowed_origins,
     allow_credentials=True if "*" not in allowed_origins else False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-API-Key",
+        "X-Ops-Key",
+        "X-Admin-Key",
+        "Accept",
+        "Origin",
+        "User-Agent",
+    ],
 )
-
-import logging
-import time
-from fastapi import Request
-from fastapi.responses import JSONResponse, PlainTextResponse
-
-from app.core.metrics import platform_metrics
-from app.core.slo import slo_manager
-
-logger = logging.getLogger("app.http")
 
 
 def _normalize_http_path(path: str) -> str:
@@ -66,16 +77,63 @@ def _normalize_http_path(path: str) -> str:
 
 
 @app.middleware("http")
-async def add_process_time_and_log_middleware(request: Request, call_next):
+async def security_and_telemetry_middleware(request: Request, call_next):
+    # 1. Enforce Request Body Size Limits (HTTP 413 Payload Too Large)
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            cl_int = int(content_length)
+            if cl_int > MAX_REQUEST_BODY_SIZE:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": f"Payload too large. Maximum allowed size is {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB.",
+                    },
+                )
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Invalid Content-Length header."},
+            )
+
     start_time = time.perf_counter()
-    response = await call_next(request)
+
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        safe_msg = mask_sensitive_data(str(exc))
+        http_logger.error(
+            "[HTTP_ERROR] %s %s -> Exception: %s (%.2f ms)",
+            request.method,
+            request.url.path,
+            safe_msg,
+            duration_ms,
+        )
+        # Return generic sanitized JSON 500 without leaking stack traces or internal secrets
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "An internal server error occurred."},
+        )
+
     duration_ms = (time.perf_counter() - start_time) * 1000.0
+
+    # 2. Add Comprehensive Security & Telemetry Headers
     response.headers["X-Process-Time"] = f"{duration_ms:.2f}ms"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; font-src 'self' https:; connect-src 'self' https:; "
+        "frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
+    )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
 
-    # Record low-cardinality HTTP structured metrics
+    # 3. Record Low-Cardinality HTTP Structured Metrics
     norm_path = _normalize_http_path(request.url.path)
     status_group = f"{response.status_code // 100}xx"
     counter = platform_metrics.get_counter("http_requests_total")
@@ -85,7 +143,7 @@ async def add_process_time_and_log_middleware(request: Request, call_next):
     if hist:
         hist.observe(duration_ms, labels={"method": request.method, "path": norm_path})
 
-    logger.info(
+    http_logger.info(
         "[HTTP] %s %s -> %d (%.2f ms)",
         request.method,
         request.url.path,
@@ -95,6 +153,7 @@ async def add_process_time_and_log_middleware(request: Request, call_next):
     return response
 
 
+# Include application routers
 app.include_router(topics_router, prefix="/api")
 app.include_router(workers_router, prefix="/api")
 app.include_router(ops_router, prefix="/api")
@@ -130,7 +189,7 @@ def readiness_check():
             conn.execute(text("SELECT 1"))
         db_connected = True
     except Exception as e:
-        logger.error("Readiness database ping failed: %s", str(e))
+        logger.error("Readiness database ping failed: %s", mask_sensitive_data(str(e)))
         db_connected = False
 
     if not db_connected:
@@ -169,7 +228,3 @@ def readiness_check():
             "half_open": half_open_breakers,
         },
     }
-
-
-
-

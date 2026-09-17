@@ -9,13 +9,21 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.alerting import alert_manager
+from app.core.audit import record_audit_event
 from app.core.metrics import platform_metrics
 from app.core import resource_governor
-from app.core.security import validate_slug
+from app.core.security import (
+    SecurityRole,
+    mask_sensitive_data,
+    require_admin,
+    require_operator,
+    require_role,
+    validate_slug,
+)
 from app.core.slo import slo_manager
 from app.core.telemetry import PipelineTimingTracker, ops_metrics
 from app.database.database import get_db
-from app.database.models import Topic
+from app.database.models import SecurityAuditLog, Topic
 from app.ingestion.pipeline import IngestionPipeline
 from app.llm.pipeline import PerspectivePipeline
 from app.processing.cluster_pipeline import ClusterPipeline
@@ -40,23 +48,9 @@ def _enforce_ops_rate_limit(key: str):
         )
 
 
-def verify_ops_control_access(
-    x_ops_key: Optional[str] = Header(default=None, alias="X-Ops-Key"),
-) -> None:
-    """Configurable security guard for operational modification endpoints."""
-    ops_enabled = os.getenv("ENABLE_OPS_CONTROLS", "true").lower() in ("true", "1", "yes")
-    if not ops_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Operational control endpoints are disabled in this environment",
-        )
+# Backward compatibility alias for operational controls
+verify_ops_control_access = require_operator
 
-    required_key = os.getenv("OPS_API_KEY", "").strip()
-    if required_key and x_ops_key != required_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing X-Ops-Key header for operational controls",
-        )
 
 
 @router.get(
@@ -498,6 +492,61 @@ def get_ops_history(
     }
 
 
+@router.get(
+    "/audit-logs",
+    summary="Query persisted security audit trail with filtering and pagination",
+    dependencies=[Depends(require_operator)],
+)
+def get_security_audit_logs(
+    action: Optional[str] = Query(default=None, description="Filter by action name (e.g. auth_failure, backup_created)"),
+    status: Optional[str] = Query(default=None, description="Filter by status (e.g. allowed, denied, failed)"),
+    actor: Optional[str] = Query(default=None, description="Filter by actor identifier"),
+    start_time: Optional[str] = Query(default=None, description="ISO datetime lower bound"),
+    end_time: Optional[str] = Query(default=None, description="ISO datetime upper bound"),
+    page: int = Query(default=1, ge=1, description="1-based page number"),
+    limit: int = Query(default=50, ge=1, le=100, description="Items per page"),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Retrieve security audit events, authorization logs, and administrative actions without leaking credentials."""
+    q = db.query(SecurityAuditLog)
+    if action:
+        q = q.filter(SecurityAuditLog.action == action)
+    if status:
+        q = q.filter(SecurityAuditLog.status == status)
+    if actor:
+        q = q.filter(SecurityAuditLog.actor == actor)
+
+    if start_time:
+        try:
+            start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+            q = q.filter(SecurityAuditLog.timestamp >= start_dt)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid start_time format. Expected ISO 8601.")
+
+    if end_time:
+        try:
+            end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            q = q.filter(SecurityAuditLog.timestamp <= end_dt)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid end_time format. Expected ISO 8601.")
+
+    total_count = q.count()
+    offset = (page - 1) * limit
+    rows = q.order_by(SecurityAuditLog.timestamp.desc()).offset(offset).limit(limit).all()
+    total_pages = (total_count + limit - 1) // limit if total_count > 0 else 1
+
+    return {
+        "status": "success",
+        "page": page,
+        "limit": limit,
+        "total_count": total_count,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_prev": page > 1,
+        "audit_logs": [r.to_dict() for r in rows],
+    }
+
+
 # ==========================================
 # Protected Operational Controls
 # ==========================================
@@ -506,12 +555,22 @@ def get_ops_history(
 @router.post(
     "/alerts/evaluate",
     summary="Trigger immediate alert evaluation cycle",
-    dependencies=[Depends(verify_ops_control_access)],
+    dependencies=[Depends(require_operator)],
 )
-def trigger_ops_alert_evaluate(db: Session = Depends(get_db)) -> Dict[str, Any]:
+def trigger_ops_alert_evaluate(request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """Evaluate all alert rules against live telemetry, database, and worker states."""
     try:
-        return alert_manager.evaluate(db=db)
+        res = alert_manager.evaluate(db=db)
+        record_audit_event(
+            action="alert_evaluation_triggered",
+            actor=getattr(request.state, "actor", "operator"),
+            role=getattr(request.state, "role", SecurityRole.OPERATOR).value if hasattr(getattr(request.state, "role", None), "value") else str(getattr(request.state, "role", "operator")),
+            resource="/api/ops/alerts/evaluate",
+            ip_address=request.client.host if request.client else None,
+            status="allowed",
+            db=db,
+        )
+        return res
     except Exception as e:
         logger.error("Alert evaluation failed: %s", str(e))
         raise HTTPException(
@@ -523,15 +582,28 @@ def trigger_ops_alert_evaluate(db: Session = Depends(get_db)) -> Dict[str, Any]:
 @router.post(
     "/run-trending",
     summary="Trigger immediate trending discovery cycle",
-    dependencies=[Depends(verify_ops_control_access)],
+    dependencies=[Depends(require_operator)],
 )
 def trigger_ops_trending_discovery(
+    request: Request,
     limit_per_provider: int = Query(default=10, ge=1, le=50),
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Trigger external trend signal discovery across providers."""
     _enforce_ops_rate_limit("ops:trending")
     try:
-        return run_candidate_discovery_job(limit_per_provider=limit_per_provider)
+        res = run_candidate_discovery_job(limit_per_provider=limit_per_provider)
+        record_audit_event(
+            action="trending_discovery_triggered",
+            actor=getattr(request.state, "actor", "operator"),
+            role=getattr(request.state, "role", SecurityRole.OPERATOR).value if hasattr(getattr(request.state, "role", None), "value") else str(getattr(request.state, "role", "operator")),
+            resource="/api/ops/run-trending",
+            ip_address=request.client.host if request.client else None,
+            status="allowed",
+            details={"limit_per_provider": limit_per_provider},
+            db=db,
+        )
+        return res
     except Exception as e:
         logger.error("Ops run-trending failed: %s", str(e))
         raise HTTPException(
@@ -543,10 +615,11 @@ def trigger_ops_trending_discovery(
 @router.post(
     "/refresh-topic/{slug}",
     summary="Trigger operational refresh for a specific topic",
-    dependencies=[Depends(verify_ops_control_access)],
+    dependencies=[Depends(require_operator)],
 )
 def trigger_ops_refresh_topic(
     slug: str,
+    request: Request,
     force: bool = Query(default=True, description="Force refresh even if topic appears stagnant"),
     min_volume_threshold: int = Query(default=30, ge=2),
     db: Session = Depends(get_db),
@@ -573,6 +646,16 @@ def trigger_ops_refresh_topic(
             min_volume_threshold=min_volume_threshold,
             force_refresh=force,
         )
+        record_audit_event(
+            action="topic_refresh_triggered",
+            actor=getattr(request.state, "actor", "operator"),
+            role=getattr(request.state, "role", SecurityRole.OPERATOR).value if hasattr(getattr(request.state, "role", None), "value") else str(getattr(request.state, "role", "operator")),
+            resource=f"/api/ops/refresh-topic/{slug}",
+            ip_address=request.client.host if request.client else None,
+            status="allowed",
+            details={"slug": slug, "force": force},
+            db=db,
+        )
         return {
             "status": "success",
             "topic_slug": slug,
@@ -591,14 +674,16 @@ def trigger_ops_refresh_topic(
 @router.post(
     "/reprocess-topic/{slug}",
     summary="Trigger full pipeline reprocessing for a topic (Ingest -> Merge -> Cluster -> Synthesize)",
-    dependencies=[Depends(verify_ops_control_access)],
+    dependencies=[Depends(require_admin)],
 )
 def trigger_ops_reprocess_topic(
     slug: str,
+    request: Request,
     limit_per_source: int = Query(default=50, ge=1, le=100),
     min_volume_threshold: int = Query(default=30, ge=2),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
+
     """Execute complete end-to-end pipeline reprocessing with structured telemetry tracking."""
     _enforce_ops_rate_limit("ops:reprocess_topic")
     if not validate_slug(slug):
@@ -721,9 +806,10 @@ def get_backups(
 @router.post(
     "/backups/create",
     summary="Trigger immediate logical database backup",
-    dependencies=[Depends(verify_ops_control_access)],
+    dependencies=[Depends(require_admin)],
 )
 def trigger_ops_create_backup(
+    request: Request,
     dry_run: bool = Query(default=False, description="Simulate backup creation without writing to disk"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
@@ -734,12 +820,32 @@ def trigger_ops_create_backup(
     try:
         cfg = BackupConfig()
         result = create_backup(db=db, config=cfg, dry_run=dry_run)
+        record_audit_event(
+            action="database_backup_created",
+            actor=getattr(request.state, "actor", "admin"),
+            role=getattr(request.state, "role", SecurityRole.ADMIN).value if hasattr(getattr(request.state, "role", None), "value") else str(getattr(request.state, "role", "admin")),
+            resource="/api/ops/backups/create",
+            ip_address=request.client.host if request.client else None,
+            status="allowed",
+            details={"dry_run": dry_run, "backup_id": result.get("backup_id"), "status": result.get("status")},
+            db=db,
+        )
         return {
             "status": "success",
             "backup": result,
         }
     except Exception as e:
         logger.error("Ops create backup failed: %s", str(e))
+        record_audit_event(
+            action="database_backup_failed",
+            actor=getattr(request.state, "actor", "admin"),
+            role=getattr(request.state, "role", SecurityRole.ADMIN).value if hasattr(getattr(request.state, "role", None), "value") else str(getattr(request.state, "role", "admin")),
+            resource="/api/ops/backups/create",
+            ip_address=request.client.host if request.client else None,
+            status="error",
+            error_message=str(e),
+            db=db,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Backup creation failed: {str(e)[:120]}",
@@ -749,10 +855,11 @@ def trigger_ops_create_backup(
 @router.post(
     "/backups/verify/{backup_id}",
     summary="Verify integrity of a specific database backup",
-    dependencies=[Depends(verify_ops_control_access)],
+    dependencies=[Depends(require_admin)],
 )
 def trigger_ops_verify_backup(
     backup_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Verify backup file existence, non-emptiness, and SHA-256 checksum match."""
@@ -760,6 +867,16 @@ def trigger_ops_verify_backup(
 
     try:
         result = verify_backup(backup_id=backup_id, db=db)
+        record_audit_event(
+            action="database_backup_verified",
+            actor=getattr(request.state, "actor", "admin"),
+            role=getattr(request.state, "role", SecurityRole.ADMIN).value if hasattr(getattr(request.state, "role", None), "value") else str(getattr(request.state, "role", "admin")),
+            resource=f"/api/ops/backups/verify/{backup_id}",
+            ip_address=request.client.host if request.client else None,
+            status="allowed",
+            details={"backup_id": backup_id, "is_valid": result.get("is_valid")},
+            db=db,
+        )
         return {
             "status": "success",
             "verification": result,
@@ -780,7 +897,7 @@ def trigger_ops_verify_backup(
 @router.get(
     "/resource-usage",
     summary="Get current resource utilization, rate-limit usage, and budget status",
-    dependencies=[Depends(verify_ops_control_access)],
+    dependencies=[Depends(require_operator)],
 )
 def get_resource_usage() -> Dict[str, Any]:
     """Return comprehensive resource governance metrics without exposing secrets."""
@@ -831,7 +948,7 @@ def get_resource_usage() -> Dict[str, Any]:
 @router.get(
     "/resource-budgets",
     summary="Get active configured resource budget limits",
-    dependencies=[Depends(verify_ops_control_access)],
+    dependencies=[Depends(require_operator)],
 )
 def get_resource_budgets() -> Dict[str, Any]:
     """Return all configured resource budget limits without exposing secrets."""
@@ -874,19 +991,33 @@ def get_resilience_status() -> Dict[str, Any]:
 @router.post(
     "/resilience/reset",
     summary="Reset platform circuit breakers and governance failover",
-    dependencies=[Depends(verify_ops_control_access)],
+    dependencies=[Depends(require_admin)],
 )
-def reset_resilience_state() -> Dict[str, Any]:
+def reset_resilience_state(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
     """Reset all circuit breakers to CLOSED and attempt to reconnect shared governance."""
     from app.core.resilience import circuit_registry
     circuit_registry.reset_all()
     recovered = resource_governor.coordinator.reset_fallback()
+    record_audit_event(
+        action="resilience_circuit_reset",
+        actor=getattr(request.state, "actor", "admin"),
+        role=getattr(request.state, "role", SecurityRole.ADMIN).value if hasattr(getattr(request.state, "role", None), "value") else str(getattr(request.state, "role", "admin")),
+        resource="/api/ops/resilience/reset",
+        ip_address=request.client.host if request.client else None,
+        status="allowed",
+        details={"shared_governance_reconnected": recovered},
+        db=db,
+    )
     return {
         "status": "success",
         "message": "Circuit breakers reset to CLOSED",
         "shared_governance_reconnected": recovered,
         "backend_info": resource_governor.coordinator.get_backend_info(),
     }
+
 
 
 @router.get(

@@ -50,9 +50,11 @@ def verify_project_files(root: Path) -> bool:
         "backend/app/database/backup.py",
         "backend/app/database/restore.py",
         "backend/app/core/security.py",
+        "backend/app/core/audit.py",
         "backend/app/core/telemetry.py",
         "backend/app/core/alerting.py",
         "backend/app/api/topics.py",
+
         "backend/app/api/ops.py",
         "backend/app/api/workers.py",
         "backend/app/ingestion/google_news.py",

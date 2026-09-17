@@ -361,4 +361,42 @@ class SLOViolationRecord(Base):
         }
 
 
+class SecurityAuditLog(Base):
+    __tablename__ = "security_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    actor = Column(String(100), nullable=False, default="anonymous", index=True)
+    role = Column(String(50), nullable=False, default="public", index=True)
+    action = Column(String(100), nullable=False, index=True)  # auth_failure, authorization_denied, backup_created, config_changed, etc.
+    resource = Column(String(255), nullable=True, index=True)
+    ip_address = Column(String(50), nullable=True)
+    user_agent = Column(String(255), nullable=True)
+    status = Column(String(50), nullable=False, default="allowed", index=True)  # allowed, denied, failed, error
+    details_json = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_security_audit_action_timestamp", "action", "timestamp"),
+        Index("ix_security_audit_status_timestamp", "status", "timestamp"),
+        Index("ix_security_audit_actor_timestamp", "actor", "timestamp"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "actor": self.actor,
+            "role": self.role,
+            "action": self.action,
+            "resource": self.resource,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+            "status": self.status,
+            "details": self.details_json or {},
+            "error_message": self.error_message,
+        }
+
+
+
 

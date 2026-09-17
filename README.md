@@ -318,6 +318,32 @@ Vantage News provides comprehensive production observability with bounded low-ca
 
 ---
 
+## Production Security, Compliance & Data Protection
+
+Vantage News enforces defense-in-depth security across all architectural layers:
+
+1. **Centralized RBAC Hierarchy & Dual-Key Rotation**:
+   - 4-Tier privilege levels: `public` (read-only), `operator` (telemetry/evaluations/discovery), `admin` (reprocess/backups/disaster recovery/circuit reset), and `security_admin` (audit trail & key rotation governance).
+   - Constant-time secret verification (`hmac.compare_digest`) resisting timing side-channel attacks.
+   - Dual-key rotation readiness: Primary (`*_API_KEY`) and secondary (`*_API_KEY_SECONDARY`) keys allow seamless credential rotation with zero downtime.
+2. **Multi-Stage SSRF Protections**:
+   - Scheme whitelisting (`http`/`https`), embedded credential blocking (`user:pass@host`), and domain TLD restrictions.
+   - Decodes integer decimal (`2130706433`), hexadecimal (`0x7f000001`), octal (`0177.0.0.1`), and dotted hex IP representations.
+   - Rejects RFC 1918, loopback, link-local, carrier-grade NAT, and cloud metadata targets (`169.254.169.254`, `100.100.100.200`, `metadata.google.internal`).
+   - Pre-flight DNS resolution validation against internal subnets.
+3. **Security Headers & Request Body Size Limiter**:
+   - Middleware enforces HSTS (`max-age=31536000`), CSP, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, Permissions-Policy, COOP, and CORP on all HTTP responses.
+   - Enforces 2MB maximum payload size limit, rejecting oversized request bodies with HTTP 413 Payload Too Large.
+4. **Structured Security Audit Logging & APIs**:
+   - Tracks all security-sensitive actions, authentication failures, authorization denials, backup creations, configuration modifications, and circuit resets in `security_audit_logs`.
+   - Emits structured JSON logs concurrently for SIEM integration.
+   - Paginated search and filtering endpoint: `GET /api/ops/audit-logs`.
+5. **Data Retention & Privacy Controls**:
+   - Automated retention pruning in `cleanup_ops_history.py` for operational history (30d), resolved alerts (90d), and security audit logs (180d) with dry-run support.
+   - Zero raw content or credential tokens persisted in operational or audit logs.
+
+---
+
 ## Automated Quality Gates & Incident Readiness Checklist
 
 Before pushing changes or deploying to production, execute the automated verification gates:
@@ -332,12 +358,13 @@ python scripts/incident_readiness.py
 # 3. Run disaster recovery & backup readiness checklist
 python scripts/disaster_recovery_check.py
 
-# 4. Run complete backend test suite (215 unit, integration, resilience, and observability tests)
+# 4. Run complete backend test suite (238 unit, integration, resilience, observability, and security compliance tests)
 pytest backend/tests/ -v
 
 # 5. Verify frontend production compilation
 cd frontend && npm run build
 ```
+
 
 
 

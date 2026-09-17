@@ -148,4 +148,24 @@ X ────────────┘
       - `GET /metrics`: Standard Prometheus metrics exporter.
       - Frontend `/ops` Dashboard: Real-time SLO cards, error budget progress bars, burn rate badges, and live latency percentiles viewer.
 
+13. **Production Security, Compliance & Data Protection** (`app.core.security`, `app.core.audit`, `app.database.models.SecurityAuditLog`):
+    - **Centralized Authentication & RBAC Hierarchy**:
+      - 4-tier privilege hierarchy: `public` (read-only), `operator` (telemetry/evaluations/discovery), `admin` (pipeline reprocessing/backups/disaster recovery/circuit reset/worker lifecycle), and `security_admin` (audit trail & key rotation governance).
+      - Constant-time secret verification using `hmac.compare_digest()` preventing timing side-channels.
+      - Dual-key rotation readiness: Primary (`*_API_KEY`) and secondary (`*_API_KEY_SECONDARY`) keys allow seamless credential rotation without downtime.
+    - **Multi-Stage SSRF Defense**:
+      - Strict scheme whitelisting (`http`/`https`), embedded credential detection (`user:pass@host`), and domain TLD restrictions.
+      - Decodes non-standard IP notations (integer decimal, hexadecimal, dotted octal/hex) and validates against RFC 1918, loopback, link-local, carrier-grade NAT, and cloud metadata networks (`169.254.169.254`, `100.100.100.200`, `metadata.google.internal`).
+      - Optional DNS pre-flight verification prevents DNS rebinding to internal addresses.
+    - **Comprehensive Security Headers & Size Limiter Middleware**:
+      - Enforces HSTS (`max-age=31536000`), CSP (`default-src 'self'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, Permissions-Policy, COOP, and CORP on all HTTP responses.
+      - Enforces 2MB maximum payload size limit, rejecting oversized request bodies with HTTP 413 Payload Too Large.
+    - **Persistent Security Audit Logging**:
+      - Tracks all security-sensitive actions, authentication failures, authorization denials, backup creations, configuration modifications, and circuit resets in `security_audit_logs`.
+      - Emits structured JSON logs concurrently for SIEM integration.
+      - Paginated search and filtering endpoint: `GET /api/ops/audit-logs`.
+    - **Data Retention & Privacy Controls**:
+      - Automated retention pruning in `cleanup_ops_history.py` for operational history (30d), resolved alerts (90d), and security audit logs (180d) with dry-run support.
+      - Zero raw content or credential tokens persisted in operational or audit logs.
+
 
