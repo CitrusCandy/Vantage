@@ -383,3 +383,70 @@ export interface ResourceBudgetsResponse {
   };
   external_source_governance: Record<string, ExternalSourceConfig>;
 }
+
+// ==========================================
+// Observability & SLO Types
+// ==========================================
+
+export interface SLIEvaluation {
+  slo_name: string;
+  display_name: string;
+  target: number;
+  current_value: number;
+  unit: string;
+  status: "COMPLIANT" | "WARNING" | "VIOLATED" | "INSUFFICIENT_DATA";
+  error_budget_total: number;
+  error_budget_consumed: number;
+  error_budget_remaining_percent: number;
+  burn_rate: number;
+  window_samples: number;
+  evaluated_at: string;
+  details: Record<string, any>;
+}
+
+export interface SLOSummaryResponse {
+  overall_status: "HEALTHY" | "DEGRADED" | "CRITICAL";
+  total_slos: number;
+  compliant: number;
+  warning: number;
+  violated: number;
+  health_score_percent: number;
+  evaluations: Record<string, SLIEvaluation>;
+  evaluated_at: string;
+}
+
+export interface MetricPercentiles {
+  count: number;
+  window_samples?: number;
+  sum: number;
+  mean: number;
+  min: number;
+  max: number;
+  p50: number;
+  p90: number;
+  p95: number;
+  p99: number;
+}
+
+export interface MetricSample {
+  labels: Record<string, string>;
+  value?: number;
+  percentiles?: MetricPercentiles;
+  buckets?: Record<string, number>;
+  last_updated?: number;
+}
+
+export interface MetricDefinition {
+  name: string;
+  type: "counter" | "gauge" | "histogram";
+  description: string;
+  unit: string;
+  total?: number;
+  samples: MetricSample[];
+}
+
+export interface PlatformMetricsResponse {
+  timestamp: string;
+  metrics: Record<string, MetricDefinition>;
+}
+

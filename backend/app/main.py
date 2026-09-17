@@ -40,8 +40,29 @@ app.add_middleware(
 import logging
 import time
 from fastapi import Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+
+from app.core.metrics import platform_metrics
+from app.core.slo import slo_manager
 
 logger = logging.getLogger("app.http")
+
+
+def _normalize_http_path(path: str) -> str:
+    """Normalize URL paths to bounded low-cardinality label values."""
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return "/"
+    if parts[0] == "api" and len(parts) > 1:
+        if parts[1] == "topics":
+            if len(parts) >= 3 and parts[2] in ("trending", "search", "categories"):
+                return f"/api/topics/{parts[2]}"
+            elif len(parts) >= 3:
+                return "/api/topics/{slug}"
+            return "/api/topics"
+        if parts[1] in ("ops", "workers"):
+            return f"/api/{parts[1]}/{parts[2]}" if len(parts) >= 3 else f"/api/{parts[1]}"
+    return "/" + "/".join(parts[:2])
 
 
 @app.middleware("http")
@@ -53,6 +74,17 @@ async def add_process_time_and_log_middleware(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+    # Record low-cardinality HTTP structured metrics
+    norm_path = _normalize_http_path(request.url.path)
+    status_group = f"{response.status_code // 100}xx"
+    counter = platform_metrics.get_counter("http_requests_total")
+    if counter:
+        counter.inc(labels={"method": request.method, "path": norm_path, "status": status_group})
+    hist = platform_metrics.get_histogram("http_request_duration_ms")
+    if hist:
+        hist.observe(duration_ms, labels={"method": request.method, "path": norm_path})
+
     logger.info(
         "[HTTP] %s %s -> %d (%.2f ms)",
         request.method,
@@ -68,7 +100,13 @@ app.include_router(workers_router, prefix="/api")
 app.include_router(ops_router, prefix="/api")
 
 
-from fastapi.responses import JSONResponse
+@app.get("/metrics", response_class=PlainTextResponse)
+def prometheus_metrics():
+    """Prometheus exposition metrics endpoint."""
+    return PlainTextResponse(
+        platform_metrics.generate_prometheus_text(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 @app.get("/health")
@@ -131,6 +169,7 @@ def readiness_check():
             "half_open": half_open_breakers,
         },
     }
+
 
 
 

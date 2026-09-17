@@ -1,18 +1,21 @@
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from enum import Enum
 import json
 import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core.metrics import platform_metrics
+from app.core.resilience import CircuitState, circuit_registry
 from app.core.security import mask_sensitive_data
+from app.core.slo import SLOStatus, slo_manager
 from app.core.telemetry import ops_metrics
 from app.workers.scheduler import scheduler
 
@@ -33,8 +36,8 @@ class AlertInstance:
     component: str
     message: str
     status: str = "active"  # "active" or "resolved"
-    first_seen: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    last_seen: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    first_seen: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    last_seen: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     resolved_at: Optional[str] = None
     occurrence_count: int = 1
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -106,9 +109,17 @@ class AlertConfig:
     def max_resolved_history(self) -> int:
         return int(os.getenv("ALERT_MAX_RESOLVED_HISTORY", "50"))
 
+    @property
+    def flapping_window_seconds(self) -> float:
+        return float(os.getenv("ALERT_FLAPPING_WINDOW_SECONDS", "300.0"))
+
+    @property
+    def flapping_threshold_transitions(self) -> int:
+        return int(os.getenv("ALERT_FLAPPING_THRESHOLD_TRANSITIONS", "4"))
+
 
 class AlertManager:
-    """Thread-safe centralized alert evaluation engine with deduplication, cooldown, and lifecycle tracking."""
+    """Thread-safe centralized alert evaluation engine with deduplication, cooldown, flapping suppression, and lifecycle tracking."""
 
     def __init__(self, config: Optional[AlertConfig] = None):
         self._lock = threading.Lock()
@@ -117,6 +128,23 @@ class AlertManager:
         self.resolved_history: deque = deque(maxlen=self.config.max_resolved_history)
         self.last_evaluation_time: Optional[str] = None
         self._loaded_from_db: bool = False
+        # Flapping tracking: alert_id -> list of transition timestamps
+        self._transition_history: Dict[str, deque] = {}
+
+    def _is_flapping(self, alert_id: str, now_ts: float) -> bool:
+        """Check if an alert is rapidly transitioning between states."""
+        history = self._transition_history.get(alert_id)
+        if not history:
+            return False
+        cutoff = now_ts - self.config.flapping_window_seconds
+        while history and history[0] < cutoff:
+            history.popleft()
+        return len(history) >= self.config.flapping_threshold_transitions
+
+    def _record_transition(self, alert_id: str, now_ts: float) -> None:
+        if alert_id not in self._transition_history:
+            self._transition_history[alert_id] = deque(maxlen=20)
+        self._transition_history[alert_id].append(now_ts)
 
     def _ensure_loaded_from_db(self, db: Optional[Session] = None):
         """Restore active alerts and resolved history from database upon process restart."""
@@ -145,8 +173,8 @@ class AlertManager:
                         component=item.component,
                         message=item.message,
                         status="active",
-                        first_seen=item.first_seen.isoformat() if item.first_seen else datetime.utcnow().isoformat(),
-                        last_seen=item.last_seen.isoformat() if item.last_seen else datetime.utcnow().isoformat(),
+                        first_seen=item.first_seen.isoformat() if item.first_seen else datetime.now(timezone.utc).isoformat(),
+                        last_seen=item.last_seen.isoformat() if item.last_seen else datetime.now(timezone.utc).isoformat(),
                         occurrence_count=item.occurrence_count,
                         metadata=item.metadata_json or {},
                     )
@@ -169,8 +197,8 @@ class AlertManager:
                         component=item.component,
                         message=item.message,
                         status="resolved",
-                        first_seen=item.first_seen.isoformat() if item.first_seen else datetime.utcnow().isoformat(),
-                        last_seen=item.last_seen.isoformat() if item.last_seen else datetime.utcnow().isoformat(),
+                        first_seen=item.first_seen.isoformat() if item.first_seen else datetime.now(timezone.utc).isoformat(),
+                        last_seen=item.last_seen.isoformat() if item.last_seen else datetime.now(timezone.utc).isoformat(),
                         resolved_at=item.resolved_at.isoformat() if item.resolved_at else None,
                         occurrence_count=item.occurrence_count,
                         metadata=item.metadata_json or {},
@@ -211,14 +239,17 @@ class AlertManager:
             "last_seen": alert.last_seen,
             "resolved_at": alert.resolved_at,
         }
-        logger.warning("[ALERT %s] %s", event_type.upper(), json.dumps(payload))
+        if event_type == "recovered" or event_type == "resolved":
+            logger.info("[ALERT %s] %s", event_type.upper(), json.dumps(payload))
+        else:
+            logger.warning("[ALERT %s] %s", event_type.upper(), json.dumps(payload))
 
     def evaluate(self, db: Optional[Session] = None) -> Dict[str, Any]:
-        """Perform a full alert evaluation cycle against current database, workers, pipeline, and source telemetry."""
+        """Perform a full alert evaluation cycle against current database, workers, pipeline, source telemetry, and SLOs."""
         if not self.config.enabled:
             return {
                 "status": "disabled",
-                "evaluated_at": datetime.utcnow().isoformat(),
+                "evaluated_at": datetime.now(timezone.utc).isoformat(),
                 "active_count": 0,
                 "resolved_count": 0,
                 "active_alerts": [],
@@ -228,9 +259,10 @@ class AlertManager:
         # Ensure active alerts from previous server runs are restored
         self._ensure_loaded_from_db(db)
 
-        now_dt = datetime.utcnow()
+        now_dt = datetime.now(timezone.utc)
+        now_ts = time.time()
         now_iso = now_dt.isoformat()
-        current_firing_keys = set()
+        current_firing_keys: Set[str] = set()
 
         # -------------------------------------------------------------
         # 1. Database Connectivity & Readiness
@@ -252,6 +284,7 @@ class AlertManager:
                     message=f"Database connectivity check failed: {str(e)[:120]}",
                     metadata={"error": str(e)[:120], "latency_ms": db_latency_ms},
                     firing_keys=current_firing_keys,
+                    now_ts=now_ts,
                 )
 
             if db_connected and db_latency_ms > self.config.db_latency_threshold_ms:
@@ -262,6 +295,7 @@ class AlertManager:
                     message=f"Database ping latency ({db_latency_ms}ms) exceeded threshold ({self.config.db_latency_threshold_ms}ms)",
                     metadata={"latency_ms": db_latency_ms, "threshold_ms": self.config.db_latency_threshold_ms},
                     firing_keys=current_firing_keys,
+                    now_ts=now_ts,
                 )
 
         # -------------------------------------------------------------
@@ -283,6 +317,7 @@ class AlertManager:
                     message=f"Background worker encountered critical error: {last_error[:100]}",
                     metadata={"last_error": last_error},
                     firing_keys=current_firing_keys,
+                    now_ts=now_ts,
                 )
             elif not is_running:
                 self._record_firing_alert(
@@ -292,10 +327,13 @@ class AlertManager:
                     message="Background worker scheduler is inactive or stopped",
                     metadata={"is_running": False},
                     firing_keys=current_firing_keys,
+                    now_ts=now_ts,
                 )
             elif last_run_time_str:
                 try:
-                    last_run_dt = datetime.fromisoformat(last_run_time_str)
+                    last_run_dt = datetime.fromisoformat(last_run_time_str.replace("Z", "+00:00"))
+                    if last_run_dt.tzinfo is None:
+                        last_run_dt = last_run_dt.replace(tzinfo=timezone.utc)
                     elapsed_seconds = (now_dt - last_run_dt).total_seconds()
                     if elapsed_seconds > expected_window_seconds:
                         self._record_firing_alert(
@@ -309,6 +347,7 @@ class AlertManager:
                                 "last_run_time": last_run_time_str,
                             },
                             firing_keys=current_firing_keys,
+                            now_ts=now_ts,
                         )
                 except Exception as e:
                     logger.warning("Error parsing worker last_run_time: %s", e)
@@ -319,18 +358,18 @@ class AlertManager:
         source_summary = ops_metrics.get_source_health_summary()
         for src_name, src_data in source_summary.items():
             if not src_data.get("enabled", True):
-                # Do not trigger false alarms on disabled sources
                 continue
 
             failures = src_data.get("failure_count", 0) + src_data.get("timeout_count", 0)
             successes = src_data.get("success_count", 0)
-            total = failures + successes
             last_success_str = src_data.get("last_success")
 
             # A. Stale Source Detection
             if last_success_str:
                 try:
-                    last_succ_dt = datetime.fromisoformat(last_success_str)
+                    last_succ_dt = datetime.fromisoformat(last_success_str.replace("Z", "+00:00"))
+                    if last_succ_dt.tzinfo is None:
+                        last_succ_dt = last_succ_dt.replace(tzinfo=timezone.utc)
                     elapsed_src_sec = (now_dt - last_succ_dt).total_seconds()
                     max_stale_sec = self.config.source_stale_hours * 3600
                     if elapsed_src_sec > max_stale_sec:
@@ -341,6 +380,7 @@ class AlertManager:
                             message=f"Ingestion source '{src_name}' has no successful ingestion in {round(elapsed_src_sec/3600, 1)} hours",
                             metadata={"source": src_name, "last_success": last_success_str},
                             firing_keys=current_firing_keys,
+                            now_ts=now_ts,
                         )
                 except Exception as e:
                     logger.warning("Error parsing source last_success: %s", e)
@@ -349,7 +389,7 @@ class AlertManager:
             if failures >= self.config.source_failure_threshold:
                 sev = AlertSeverity.CRITICAL if src_name in ("google_news", "reddit") else AlertSeverity.WARNING
                 self._record_firing_alert(
-                    rule_name=f"source_failure_spike",
+                    rule_name="source_failure_spike",
                     component=f"source:{src_name}",
                     severity=sev,
                     message=f"Ingestion source '{src_name}' encountered {failures} failures/timeouts (threshold: {self.config.source_failure_threshold})",
@@ -360,6 +400,7 @@ class AlertManager:
                         "last_error": src_data.get("last_error_summary"),
                     },
                     firing_keys=current_firing_keys,
+                    now_ts=now_ts,
                 )
 
             # C. Specific Repeated LLM / X Failures
@@ -374,6 +415,7 @@ class AlertManager:
                         "last_error": src_data.get("last_error_summary"),
                     },
                     firing_keys=current_firing_keys,
+                    now_ts=now_ts,
                 )
             elif src_name == "x" and failures >= self.config.x_failure_threshold:
                 self._record_firing_alert(
@@ -386,6 +428,7 @@ class AlertManager:
                         "last_error": src_data.get("last_error_summary"),
                     },
                     firing_keys=current_firing_keys,
+                    now_ts=now_ts,
                 )
 
         # -------------------------------------------------------------
@@ -394,7 +437,6 @@ class AlertManager:
         pipe_metrics = ops_metrics.get_pipeline_metrics()
         recent_runs = pipe_metrics.get("recent_runs", [])
         if recent_runs:
-            # Check recent failure count
             recent_fails = sum(1 for r in recent_runs[:5] if r.get("status") != "success")
             if recent_fails >= self.config.pipeline_failure_threshold:
                 self._record_firing_alert(
@@ -404,9 +446,9 @@ class AlertManager:
                     message=f"Discourse pipeline experienced {recent_fails} failures in last {min(5, len(recent_runs))} runs",
                     metadata={"recent_failures": recent_fails, "sample_size": min(5, len(recent_runs))},
                     firing_keys=current_firing_keys,
+                    now_ts=now_ts,
                 )
 
-            # Check pipeline high latency
             avg_duration_ms = pipe_metrics.get("avg_duration_ms", 0.0)
             latest_run_ms = recent_runs[0].get("total_duration_ms", 0.0) if recent_runs else 0.0
             if latest_run_ms > self.config.pipeline_latency_threshold_ms or avg_duration_ms > self.config.pipeline_latency_threshold_ms:
@@ -421,10 +463,57 @@ class AlertManager:
                         "threshold_ms": self.config.pipeline_latency_threshold_ms,
                     },
                     firing_keys=current_firing_keys,
+                    now_ts=now_ts,
                 )
 
         # -------------------------------------------------------------
-        # 5. Resolve Any Alerts That Are No Longer Firing
+        # 5. Circuit Breaker States
+        # -------------------------------------------------------------
+        cb_states = circuit_registry.get_all_states()
+        for cb_name, cb_info in cb_states.items():
+            if cb_info.get("state") == "OPEN":
+                self._record_firing_alert(
+                    rule_name="circuit_breaker_open",
+                    component=f"circuit:{cb_name}",
+                    severity=AlertSeverity.CRITICAL if "db" in cb_name or "openai" in cb_name else AlertSeverity.WARNING,
+                    message=f"Circuit breaker for '{cb_name}' is OPEN. Requests are failing fast to protect dependency.",
+                    metadata=cb_info,
+                    firing_keys=current_firing_keys,
+                    now_ts=now_ts,
+                )
+
+        # -------------------------------------------------------------
+        # 6. Service Level Objectives (SLO) Violations & Burn Rates
+        # -------------------------------------------------------------
+        slo_evals = slo_manager.evaluate_all()
+        slo_violations_to_persist = []
+
+        for slo_name, slo_eval in slo_evals.items():
+            if slo_eval.status == SLOStatus.VIOLATED:
+                self._record_firing_alert(
+                    rule_name=f"slo_violation_{slo_name}",
+                    component=f"slo:{slo_name}",
+                    severity=AlertSeverity.CRITICAL,
+                    message=f"SLO '{slo_eval.display_name}' violated: current={slo_eval.current_value}{slo_eval.unit}, target={slo_eval.target}{slo_eval.unit} (burn_rate={slo_eval.burn_rate:.1f}x)",
+                    metadata=slo_eval.to_dict(),
+                    firing_keys=current_firing_keys,
+                    now_ts=now_ts,
+                )
+                slo_violations_to_persist.append(slo_eval)
+
+            elif slo_eval.status == SLOStatus.WARNING:
+                self._record_firing_alert(
+                    rule_name=f"slo_warning_{slo_name}",
+                    component=f"slo:{slo_name}",
+                    severity=AlertSeverity.WARNING,
+                    message=f"SLO '{slo_eval.display_name}' approaching threshold: current={slo_eval.current_value}{slo_eval.unit}, target={slo_eval.target}{slo_eval.unit}",
+                    metadata=slo_eval.to_dict(),
+                    firing_keys=current_firing_keys,
+                    now_ts=now_ts,
+                )
+
+        # -------------------------------------------------------------
+        # 7. Resolve Any Alerts That Are No Longer Firing
         # -------------------------------------------------------------
         resolved_alerts_to_persist = []
         with self._lock:
@@ -435,18 +524,19 @@ class AlertManager:
                     alert.status = "resolved"
                     alert.resolved_at = now_iso
                     self.resolved_history.appendleft(alert)
-                    self._log_structured_alert("resolved", alert)
+                    self._record_transition(key, now_ts)
+                    self._log_structured_alert("recovered", alert)
                     resolved_alerts_to_persist.append(alert)
 
             self.last_evaluation_time = now_iso
             active_list = [a.to_dict() for a in self.active_alerts.values()]
             resolved_list = [a.to_dict() for a in list(self.resolved_history)]
 
-        # Persist resolved status to DB
-        if resolved_alerts_to_persist:
+        # Persist resolved alerts and SLO violations to DB
+        if resolved_alerts_to_persist or slo_violations_to_persist:
             try:
                 from app.database.database import SessionLocal
-                from app.database.models import OperationalAlert
+                from app.database.models import OperationalAlert, SLOViolationRecord
 
                 db_sess = db if db is not None else SessionLocal()
                 should_close = db is None
@@ -456,15 +546,29 @@ class AlertManager:
                         if db_row:
                             db_row.status = "resolved"
                             db_row.resolved_at = now_dt
+
+                    for s_eval in slo_violations_to_persist:
+                        slo_rec = SLOViolationRecord(
+                            slo_name=s_eval.slo_name,
+                            status=s_eval.status.value,
+                            target_value=s_eval.target,
+                            actual_value=s_eval.current_value,
+                            burn_rate=s_eval.burn_rate,
+                            error_budget_remaining_percent=s_eval.error_budget_remaining_percent,
+                            started_at=now_dt,
+                            details_json=s_eval.to_dict(),
+                        )
+                        db_sess.add(slo_rec)
+
                     db_sess.commit()
                 except Exception as db_err:
                     db_sess.rollback()
-                    logger.warning("Failed to persist resolved alerts to DB: %s", db_err)
+                    logger.warning("Failed to persist alerts/SLO records to DB: %s", db_err)
                 finally:
                     if should_close:
                         db_sess.close()
             except Exception as e:
-                logger.warning("Resolved alerts DB sync skipped: %s", e)
+                logger.warning("DB sync skipped: %s", e)
 
         return {
             "status": "evaluated",
@@ -482,13 +586,14 @@ class AlertManager:
         severity: AlertSeverity,
         message: str,
         metadata: Dict[str, Any],
-        firing_keys: set,
+        firing_keys: Set[str],
+        now_ts: float,
         db: Optional[Session] = None,
     ):
         """Thread-safe deduplication, cooldown registration, and database persistence for active alerts."""
         alert_id = f"{rule_name}:{component}"
         firing_keys.add(alert_id)
-        now_dt = datetime.utcnow()
+        now_dt = datetime.now(timezone.utc)
         now_iso = now_dt.isoformat()
         sanitized_msg = mask_sensitive_data(message)
         sanitized_meta = self._sanitize_metadata(metadata)
@@ -504,6 +609,7 @@ class AlertManager:
                 existing.severity = severity
                 target_instance = existing
             else:
+                self._record_transition(alert_id, now_ts)
                 new_alert = AlertInstance(
                     id=alert_id,
                     rule_name=rule_name,
@@ -586,9 +692,9 @@ class AlertManager:
             self.active_alerts.clear()
             self.resolved_history.clear()
             self.last_evaluation_time = None
+            self._transition_history.clear()
             self._loaded_from_db = True
 
 
 # Global singleton instance for alerting
 alert_manager = AlertManager()
-

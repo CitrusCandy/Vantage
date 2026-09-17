@@ -327,3 +327,38 @@ class BackupRecord(Base):
         }
 
 
+class SLOViolationRecord(Base):
+    __tablename__ = "slo_violation_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slo_name = Column(String(100), nullable=False, index=True)
+    status = Column(String(50), nullable=False, index=True)  # WARNING, VIOLATED, RESOLVED
+    target_value = Column(Float, nullable=False)
+    actual_value = Column(Float, nullable=False)
+    burn_rate = Column(Float, nullable=False, default=0.0)
+    error_budget_remaining_percent = Column(Float, nullable=False, default=100.0)
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    resolved_at = Column(DateTime, nullable=True)
+    details_json = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_slo_violations_name_started", "slo_name", "started_at"),
+        Index("ix_slo_violations_status_started", "status", "started_at"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "slo_name": self.slo_name,
+            "status": self.status,
+            "target_value": self.target_value,
+            "actual_value": round(self.actual_value, 4),
+            "burn_rate": round(self.burn_rate, 2),
+            "error_budget_remaining_percent": round(self.error_budget_remaining_percent, 2),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "details": self.details_json or {},
+        }
+
+
+

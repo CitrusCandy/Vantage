@@ -292,7 +292,20 @@ export async function getResourceBudgets(apiKey?: string): Promise<ResourceBudge
   return fetchJson<ResourceBudgetsResponse>("/ops/resource-budgets", { headers }, "getResourceBudgets");
 }
 
+// ==========================================
+// SLO & Platform Metrics APIs
+// ==========================================
+
+export async function getSLOStatus(): Promise<import("./types").SLOSummaryResponse> {
+  return fetchJson<import("./types").SLOSummaryResponse>("/ops/slos", {}, "getSLOStatus");
+}
+
+export async function getPlatformMetrics(): Promise<import("./types").PlatformMetricsResponse> {
+  return fetchJson<import("./types").PlatformMetricsResponse>("/ops/metrics", {}, "getPlatformMetrics");
+}
+
 /** Utility: get minimum safe polling interval in ms. */
 export function getMinPollIntervalMs(): number {
   return MIN_POLL_INTERVAL_MS;
 }
+

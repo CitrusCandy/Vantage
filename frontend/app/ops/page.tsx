@@ -44,6 +44,8 @@ import {
   getOpsWorkerMetrics,
   getResourceUsage,
   getResourceBudgets,
+  getSLOStatus,
+  getPlatformMetrics,
   RateLimitError,
   triggerOpsAlertEvaluate,
   triggerOpsCreateBackup,
@@ -67,6 +69,8 @@ import {
   OpsWorkerMetrics,
   ResourceUsageResponse,
   ResourceBudgetsResponse,
+  SLOSummaryResponse,
+  PlatformMetricsResponse,
 } from "@/lib/types";
 import { formatDate, formatTimeAgo } from "@/lib/utils";
 
@@ -76,6 +80,8 @@ export default function OperationsPage() {
   const [sourceHealth, setSourceHealth] = useState<OpsSourceHealth | null>(null);
   const [workerMetrics, setWorkerMetrics] = useState<OpsWorkerMetrics | null>(null);
   const [alertsSummary, setAlertsSummary] = useState<AlertSummary | null>(null);
+  const [sloSummary, setSloSummary] = useState<SLOSummaryResponse | null>(null);
+  const [platformMetrics, setPlatformMetrics] = useState<PlatformMetricsResponse | null>(null);
 
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
@@ -158,18 +164,22 @@ export default function OperationsPage() {
   const loadAllTelemetry = async () => {
     try {
       setIsRefreshing(true);
-      const [ov, pm, sh, wm, al] = await Promise.all([
+      const [ov, pm, sh, wm, al, slos, pMetrics] = await Promise.all([
         getOpsOverview(),
         getOpsPipelineMetrics(),
         getOpsSourceHealth(),
         getOpsWorkerMetrics(),
         getOpsAlerts(),
+        getSLOStatus().catch(() => null),
+        getPlatformMetrics().catch(() => null),
       ]);
       setOverview(ov);
       setPipelineMetrics(pm);
       setSourceHealth(sh);
       setWorkerMetrics(wm);
       setAlertsSummary(al);
+      if (slos) setSloSummary(slos);
+      if (pMetrics) setPlatformMetrics(pMetrics);
       loadBackups();
       // Load resource governance data
       try {
@@ -1461,7 +1471,182 @@ export default function OperationsPage() {
           )}
         </div>
 
-        {/* 7. Resource Governance Section */}
+        {/* 7. Service Level Objectives (SLOs) & Reliability Engineering */}
+        <div className="p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
+                <Activity className="w-5 h-5" />
+              </div>
+              <div>
+                <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                  Service Level Objectives (SLOs) & Error Budgets
+                  {sloSummary && (
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+                        sloSummary.overall_status === "HEALTHY"
+                          ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                          : sloSummary.overall_status === "DEGRADED"
+                          ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                          : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+                      }`}
+                    >
+                      {sloSummary.overall_status}
+                    </span>
+                  )}
+                </h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Explicit reliability targets, real-time SLI tracking, error budget consumption, and burn rates.
+                </p>
+              </div>
+            </div>
+
+            {/* Health Score Pill */}
+            {sloSummary && (
+              <div className="flex items-center gap-3 bg-slate-900/80 px-4 py-2 rounded-xl border border-white/[0.06]">
+                <div className="text-right">
+                  <span className="text-[10px] text-slate-400 block">Health Score</span>
+                  <span className="text-sm font-mono font-bold text-emerald-400">
+                    {sloSummary.health_score_percent}%
+                  </span>
+                </div>
+                <div className="w-px h-6 bg-white/10" />
+                <div className="text-left text-[11px] text-slate-400 space-y-0.5">
+                  <span className="text-emerald-400 font-mono block">{sloSummary.compliant} Compliant</span>
+                  <span className="text-slate-500 font-mono block">{sloSummary.total_slos} Total Targets</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 9 SLO Cards Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {sloSummary &&
+              Object.entries(sloSummary.evaluations).map(([key, evalItem]) => {
+                const isCompliant = evalItem.status === "COMPLIANT";
+                const isWarning = evalItem.status === "WARNING";
+                const statusBadge = isCompliant
+                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                  : isWarning
+                  ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
+                  : "bg-rose-500/10 text-rose-400 border-rose-500/20";
+
+                const budgetColor =
+                  evalItem.error_budget_remaining_percent > 50
+                    ? "from-emerald-500 to-teal-500"
+                    : evalItem.error_budget_remaining_percent > 20
+                    ? "from-amber-500 to-yellow-500"
+                    : "from-rose-500 to-red-500";
+
+                return (
+                  <div
+                    key={key}
+                    className="p-4 rounded-xl bg-slate-900/60 border border-white/[0.04] hover:border-white/[0.08] transition-all space-y-3"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <span className="text-xs font-semibold text-white block">
+                          {evalItem.display_name}
+                        </span>
+                        <span className="text-[10px] text-slate-400">
+                          Target: {evalItem.target} {evalItem.unit}
+                        </span>
+                      </div>
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase border ${statusBadge}`}>
+                        {evalItem.status}
+                      </span>
+                    </div>
+
+                    {/* Current vs Target metric */}
+                    <div className="flex items-baseline justify-between pt-1">
+                      <span className="text-xl font-bold font-mono text-white">
+                        {evalItem.current_value}
+                        <span className="text-xs font-normal text-slate-400 ml-1">{evalItem.unit}</span>
+                      </span>
+                      <span className="text-[11px] font-mono text-slate-400">
+                        Burn Rate: <strong className={evalItem.burn_rate > 1.0 ? "text-amber-400" : "text-slate-300"}>{evalItem.burn_rate}x</strong>
+                      </span>
+                    </div>
+
+                    {/* Error Budget Bar */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px] text-slate-400">
+                        <span>Error Budget Remaining</span>
+                        <span className="font-mono font-semibold text-slate-200">
+                          {evalItem.error_budget_remaining_percent}%
+                        </span>
+                      </div>
+                      <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full bg-gradient-to-r ${budgetColor} transition-all duration-500`}
+                          style={{ width: `${Math.min(100, Math.max(0, evalItem.error_budget_remaining_percent))}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+          </div>
+
+          {/* Real-time Metric Latency Percentiles (P50, P90, P95, P99) */}
+          {platformMetrics && (
+            <div className="pt-4 border-t border-white/[0.06] space-y-4">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Cpu className="w-3.5 h-3.5 text-purple-400" />
+                  Rolling Latency Percentiles & Histograms
+                </span>
+                <span className="text-[10px] font-mono text-slate-500">
+                  Prometheus exposition endpoint: <code className="text-slate-400 font-mono">/metrics</code>
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {[
+                  { key: "http_request_duration_ms", label: "HTTP API Gateway Latency", unit: "ms" },
+                  { key: "pipeline_duration_ms", label: "Pipeline Execution Latency", unit: "ms" },
+                  { key: "database_query_duration_ms", label: "Database Query Latency", unit: "ms" },
+                ].map((item) => {
+                  const m = platformMetrics.metrics[item.key];
+                  const pcts = m?.samples?.[0]?.percentiles;
+                  return (
+                    <div key={item.key} className="p-3.5 rounded-xl bg-slate-900/60 border border-white/[0.04] space-y-2.5">
+                      <div className="flex justify-between items-center">
+                        <span className="text-xs font-semibold text-slate-200">{item.label}</span>
+                        <span className="text-[10px] font-mono text-slate-400">{pcts?.count || 0} samples</span>
+                      </div>
+                      <div className="grid grid-cols-4 gap-1 text-center font-mono">
+                        <div className="p-1.5 rounded bg-slate-950/60">
+                          <span className="text-[9px] text-slate-500 block">P50</span>
+                          <span className="text-xs font-bold text-slate-200">{pcts?.p50 || 0}</span>
+                        </div>
+                        <div className="p-1.5 rounded bg-slate-950/60">
+                          <span className="text-[9px] text-slate-500 block">P90</span>
+                          <span className="text-xs font-bold text-slate-200">{pcts?.p90 || 0}</span>
+                        </div>
+                        <div className="p-1.5 rounded bg-slate-950/60">
+                          <span className="text-[9px] text-slate-500 block">P95</span>
+                          <span className="text-xs font-bold text-indigo-400">{pcts?.p95 || 0}</span>
+                        </div>
+                        <div className="p-1.5 rounded bg-slate-950/60">
+                          <span className="text-[9px] text-slate-500 block">P99</span>
+                          <span className="text-xs font-bold text-purple-400">{pcts?.p99 || 0}</span>
+                        </div>
+                      </div>
+                      <div className="flex justify-between text-[10px] text-slate-500 font-mono pt-1">
+                        <span>Mean: {pcts?.mean || 0}ms</span>
+                        <span>Min: {pcts?.min || 0}ms</span>
+                        <span>Max: {pcts?.max || 0}ms</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 8. Resource Governance Section */}
         <div className="p-6 rounded-2xl bg-surface-light border border-surface-border backdrop-blur-md space-y-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">

@@ -169,16 +169,34 @@ class OpsMetricsRegistry:
         stages_ms: Dict[str, float],
         status: str = "success",
         error: Optional[str] = None,
-        timestamp: Optional[datetime] = None,
         sample_size: int = 0,
         cluster_count: int = 0,
         perspective_count: int = 0,
         failure_stage: Optional[str] = None,
         error_type: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
     ):
+        """Record a completed or failed pipeline execution into in-memory ring buffer and persistent DB."""
         ts = timestamp or datetime.utcnow()
         sanitized_error = mask_sensitive_data(error) if error else None
         sanitized_err_type = mask_sensitive_data(error_type) if error_type else None
+
+        # Update structured platform metrics
+        try:
+            from app.core.metrics import platform_metrics
+            p_counter = platform_metrics.get_counter("pipeline_executions_total")
+            if p_counter:
+                p_counter.inc(labels={"pipeline": pipeline_name, "status": status})
+            p_hist = platform_metrics.get_histogram("pipeline_duration_ms")
+            if p_hist:
+                p_hist.observe(total_duration_ms, labels={"pipeline": pipeline_name})
+            if stages_ms:
+                s_hist = platform_metrics.get_histogram("pipeline_stage_duration_ms")
+                if s_hist:
+                    for s_name, s_ms in stages_ms.items():
+                        s_hist.observe(float(s_ms), labels={"stage": s_name})
+        except Exception as met_err:
+            logger.debug("Structured metrics update skipped: %s", met_err)
 
         with self._lock:
             self.recent_runs.appendleft({
@@ -248,6 +266,22 @@ class OpsMetricsRegistry:
         now_str = now_dt.isoformat()
         sanitized_err = mask_sensitive_data(error_summary) if error_summary else None
         status_val = "timeout" if is_timeout else ("success" if success else "failed")
+
+        # Update structured platform metrics
+        try:
+            from app.core.metrics import platform_metrics
+            s_counter = platform_metrics.get_counter("source_fetch_total")
+            if s_counter:
+                s_counter.inc(labels={"source": source_name, "result": status_val})
+            s_hist = platform_metrics.get_histogram("source_fetch_duration_ms")
+            if s_hist:
+                s_hist.observe(latency_ms, labels={"source": source_name})
+            if success:
+                s_gauge = platform_metrics.get_gauge("source_freshness_seconds")
+                if s_gauge:
+                    s_gauge.set(0.0, labels={"source": source_name})
+        except Exception as met_err:
+            logger.debug("Structured source metrics update skipped: %s", met_err)
 
         with self._lock:
             if source_name not in self.source_health:

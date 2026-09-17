@@ -19,6 +19,29 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
+from sqlalchemy import event
+import time
+
+
+@event.listens_for(engine, "before_cursor_execute")
+def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    conn.info.setdefault("query_start_time", []).append(time.perf_counter())
+
+
+@event.listens_for(engine, "after_cursor_execute")
+def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    try:
+        start_list = conn.info.get("query_start_time", [])
+        if start_list:
+            total = time.perf_counter() - start_list.pop()
+            duration_ms = total * 1000.0
+            from app.core.metrics import platform_metrics
+            hist = platform_metrics.get_histogram("database_query_duration_ms")
+            if hist:
+                hist.observe(duration_ms)
+    except Exception:
+        pass
+
 
 def get_db():
     """Dependency for providing a database session per request."""
@@ -27,3 +50,4 @@ def get_db():
         yield db
     finally:
         db.close()
+

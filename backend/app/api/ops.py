@@ -9,8 +9,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.alerting import alert_manager
+from app.core.metrics import platform_metrics
 from app.core import resource_governor
 from app.core.security import validate_slug
+from app.core.slo import slo_manager
 from app.core.telemetry import PipelineTimingTracker, ops_metrics
 from app.database.database import get_db
 from app.database.models import Topic
@@ -189,6 +191,7 @@ def get_operations_overview(db: Session = Depends(get_db)) -> Dict[str, Any]:
             "resolved_count": alerts_summary.get("resolved_count", 0),
             "last_evaluation_time": alerts_summary.get("last_evaluation_time"),
         },
+        "slo_summary": slo_manager.get_summary(),
         "recent_pipeline_runs": recent_pipeline_runs[:5],
         "pipeline_summary": {
             "total_runs": pipeline_metrics["total_runs"],
@@ -884,5 +887,24 @@ def reset_resilience_state() -> Dict[str, Any]:
         "shared_governance_reconnected": recovered,
         "backend_info": resource_governor.coordinator.get_backend_info(),
     }
+
+
+@router.get(
+    "/slos",
+    summary="Get Service Level Objectives (SLO) compliance and error budgets",
+)
+def get_slo_status() -> Dict[str, Any]:
+    """Return all platform SLO evaluations, remaining error budgets, and burn rates."""
+    return slo_manager.get_summary()
+
+
+@router.get(
+    "/metrics",
+    summary="Get structured JSON snapshot of all platform counters, gauges, and histograms",
+)
+def get_platform_metrics() -> Dict[str, Any]:
+    """Return point-in-time snapshot of all registered platform metrics and percentiles."""
+    return platform_metrics.get_all_metrics()
+
 
 
