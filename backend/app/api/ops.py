@@ -120,6 +120,13 @@ def get_operations_overview(db: Session = Depends(get_db)) -> Dict[str, Any]:
     # 6. Active Alerts Summary
     alerts_summary = alert_manager.get_alerts_summary()
 
+    # 7. Circuit Breakers Snapshot
+    from app.core.resilience import circuit_registry
+    breakers_status = circuit_registry.get_all_status()
+    open_breakers = [name for name, s in breakers_status.items() if s.get("state") == "OPEN"]
+    half_open_breakers = [name for name, s in breakers_status.items() if s.get("state") == "HALF_OPEN"]
+    backend_info = resource_governor.coordinator.get_backend_info()
+
     # Overall System Health
     overall_health = "healthy"
     if db_status != "healthy":
@@ -127,6 +134,8 @@ def get_operations_overview(db: Session = Depends(get_db)) -> Dict[str, Any]:
     elif alerts_summary.get("active_count", 0) > 0:
         has_critical = any(a.get("severity") == "critical" for a in alerts_summary.get("active_alerts", []))
         overall_health = "unavailable" if has_critical else "degraded"
+    elif open_breakers or half_open_breakers or backend_info.get("fallback_active"):
+        overall_health = "degraded"
     elif not worker_status["is_running"] and worker_status.get("last_error"):
         overall_health = "degraded"
 
@@ -144,6 +153,17 @@ def get_operations_overview(db: Session = Depends(get_db)) -> Dict[str, Any]:
             "total_topics": total_topics,
             "active_topics": active_topics,
             "recently_refreshed_24h": recently_refreshed_topics,
+        },
+        "governance": {
+            "backend": backend_info.get("backend"),
+            "fallback_active": backend_info.get("fallback_active"),
+            "circuit_state": backend_info.get("circuit_state", "CLOSED"),
+        },
+        "resilience": {
+            "all_healthy": len(open_breakers) == 0 and len(half_open_breakers) == 0,
+            "open_circuits": open_breakers,
+            "half_open_circuits": half_open_breakers,
+            "total_breakers": len(breakers_status),
         },
         "worker": {
             "is_running": worker_status["is_running"],
@@ -826,4 +846,43 @@ def get_resource_budgets() -> Dict[str, Any]:
             for source, data in resource_governor.external_governor.get_usage().items()
         },
     }
+
+
+@router.get(
+    "/resilience",
+    summary="Get platform circuit breaker and resilience status",
+)
+def get_resilience_status() -> Dict[str, Any]:
+    """Return status and telemetry of all platform circuit breakers and degraded states."""
+    from app.core.resilience import circuit_registry
+    breakers = circuit_registry.get_all_status()
+    all_healthy = circuit_registry.is_all_healthy()
+    backend_info = resource_governor.coordinator.get_backend_info()
+
+    return {
+        "status": "healthy" if (all_healthy and not backend_info.get("fallback_active")) else "degraded",
+        "timestamp": datetime.utcnow().isoformat(),
+        "all_healthy": all_healthy,
+        "circuit_breakers": breakers,
+        "governance_backend": backend_info,
+    }
+
+
+@router.post(
+    "/resilience/reset",
+    summary="Reset platform circuit breakers and governance failover",
+    dependencies=[Depends(verify_ops_control_access)],
+)
+def reset_resilience_state() -> Dict[str, Any]:
+    """Reset all circuit breakers to CLOSED and attempt to reconnect shared governance."""
+    from app.core.resilience import circuit_registry
+    circuit_registry.reset_all()
+    recovered = resource_governor.coordinator.reset_fallback()
+    return {
+        "status": "success",
+        "message": "Circuit breakers reset to CLOSED",
+        "shared_governance_reconnected": recovered,
+        "backend_info": resource_governor.coordinator.get_backend_info(),
+    }
+
 

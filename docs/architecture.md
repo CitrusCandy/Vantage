@@ -105,3 +105,17 @@ X ────────────┘
     - **Utilization Monitoring**: Configurable warning (70%) and critical (90%) thresholds. Budget utilization status classification (`normal`, `warning`, `critical`) exposed via operational endpoints and frontend dashboard.
     - **Operational Endpoints**: `GET /api/ops/resource-usage` and `GET /api/ops/resource-budgets` return comprehensive governance metrics, backend type, and fallback status. Both protected by `X-Ops-Key` guard.
     - **Frontend Governance Dashboard**: Resource Governance section on `/ops` with backend status badge, fallback alerts, rate limit utilization bars, concurrency slot indicators, cost tracking counters, budget utilization warnings, and external source governance panels.
+
+11. **Resilience, Fault Tolerance & Graceful Degradation** (`app.core.resilience`):
+    - **Bounded Retries with Exponential Backoff & Jitter**: Configurable `BackoffStrategy` supporting full, equal, and decorrelated jitter distributions to eliminate thundering herd behavior against third-party APIs.
+    - **Circuit Breakers**: State machine (`CLOSED`, `OPEN`, `HALF_OPEN`) protecting all external boundaries (`google_news`, `reddit`, `x`, `openai_synthesis`, `embeddings`, `redis_governance`, `trend_discovery`). Fast-fails immediately when OPEN without consuming socket/thread capacity.
+    - **Centralized Registry & Observability**: `CircuitBreakerRegistry` maintains platform-wide breaker states, short-circuit counts, failure timestamps, and exposes `GET /api/ops/resilience` and `POST /api/ops/resilience/reset`.
+    - **Cooperative Cancellation & Timeouts**: `CancellationToken` and `TimeoutScope` propagation across long-running pipelines and thread pools prevents orphan execution during worker restarts or client disconnects.
+    - **Database Transient Lock Retries**: `safe_db_operation` helper transparently retries SQLite/PostgreSQL transient concurrency locks.
+    - **Graceful Degradation & Partial Failure Isolation**:
+      - Single-source scrapers failing (e.g. Google News 503 or Reddit rate-limit) do not crash ingestion; remaining sources merge cleanly into `combined_raw_data`.
+      - LLM synthesis failure or open circuit breaker degrades gracefully to extractive perspective briefs with clear degradation notices instead of database corruption or unhandled 500 errors.
+      - Redis shared governance failure automatically degrades to in-memory local coordination with zero dropped requests, followed by self-healing reconnect probes.
+    - **Graceful Worker Lifecycle**: Background scheduler cleans up all held locks, concurrency slots, and heartbeat keys on shutdown (`SIGINT`/`SIGTERM`), and safely reclaims orphaned locks on startup.
+    - **Enriched Health/Readiness Probes**: `/health` (liveness) and `/ready` (readiness) accurately distinguish `healthy`, `degraded` (circuit open or Redis fallback active), and `unready` (database unreachable) without exposing secrets.
+

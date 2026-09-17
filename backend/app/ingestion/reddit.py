@@ -59,42 +59,52 @@ class RedditIngestor:
             timeout_seconds,
         )
 
+        from app.core.resilience import BackoffStrategy, JitterMode, reddit_breaker, retry_with_backoff
+
+        if not reddit_breaker.allow_request():
+            logger.warning("[reddit] Circuit breaker is OPEN. Short-circuiting request for topic '%s'", topic.title)
+            return []
+
         reddit = self._get_praw_instance()
         if reddit:
             try:
-                staged: List[RawReddit] = []
-                subreddit = reddit.subreddit("all")
-                for post in subreddit.search(query=topic.title, sort="relevance", limit=limit):
-                    title = getattr(post, "title", "") or ""
-                    selftext = getattr(post, "selftext", "") or ""
-                    if selftext in ["[removed]", "[deleted]"]:
-                        selftext = ""
-                    body = f"{title}\n\n{selftext}".strip() if selftext else title
+                def _do_praw():
+                    staged: List[RawReddit] = []
+                    subreddit = reddit.subreddit("all")
+                    for post in subreddit.search(query=topic.title, sort="relevance", limit=limit):
+                        title = getattr(post, "title", "") or ""
+                        selftext = getattr(post, "selftext", "") or ""
+                        if selftext in ["[removed]", "[deleted]"]:
+                            selftext = ""
+                        body = f"{title}\n\n{selftext}".strip() if selftext else title
 
-                    if not body:
-                        continue
+                        if not body:
+                            continue
 
-                    author_name = str(post.author.name) if getattr(post, "author", None) else None
-                    created_utc = (
-                        datetime.utcfromtimestamp(post.created_utc)
-                        if hasattr(post, "created_utc")
-                        else datetime.utcnow()
-                    )
+                        author_name = str(post.author.name) if getattr(post, "author", None) else None
+                        created_utc = (
+                            datetime.utcfromtimestamp(post.created_utc)
+                            if hasattr(post, "created_utc")
+                            else datetime.utcnow()
+                        )
 
-                    record = RawReddit(
-                        slug_id=topic.id,
-                        post_id=str(getattr(post, "id", "")),
-                        body=body,
-                        score=int(getattr(post, "score", 0)),
-                        num_comments=int(getattr(post, "num_comments", 0)),
-                        subreddit=str(getattr(post, "subreddit", "all")),
-                        author=author_name,
-                        created_utc=created_utc,
-                    )
-                    db.add(record)
-                    staged.append(record)
+                        record = RawReddit(
+                            slug_id=topic.id,
+                            post_id=str(getattr(post, "id", "")),
+                            body=body,
+                            score=int(getattr(post, "score", 0)),
+                            num_comments=int(getattr(post, "num_comments", 0)),
+                            subreddit=str(getattr(post, "subreddit", "all")),
+                            author=author_name,
+                            created_utc=created_utc,
+                        )
+                        db.add(record)
+                        staged.append(record)
 
-                db.commit()
+                    db.commit()
+                    return staged
+
+                staged = reddit_breaker.execute(_do_praw)
                 logger.info("[reddit] Staged %d records via PRAW for Topic ID %d", len(staged), topic.id)
                 return staged
             except Exception as e:
@@ -111,6 +121,12 @@ class RedditIngestor:
         timeout_seconds: float = 10.0,
     ) -> List[RawReddit]:
         """Fallback public REST API scraper."""
+        from app.core.resilience import BackoffStrategy, JitterMode, reddit_breaker, retry_with_backoff
+
+        if not reddit_breaker.allow_request():
+            logger.warning("[reddit] Circuit breaker is OPEN. Short-circuiting REST request for topic '%s'", topic.title)
+            return []
+
         params = urllib.parse.urlencode({
             "q": topic.title,
             "sort": "relevance",
@@ -120,10 +136,21 @@ class RedditIngestor:
         url = f"https://www.reddit.com/search.json?{params}"
         req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
 
+        def _fetch_rest():
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                return resp.read().decode("utf-8")
+
+        backoff = BackoffStrategy(base_delay=0.3, max_delay=3.0, multiplier=2.0, jitter_mode=JitterMode.FULL)
+        fetch_with_retries = retry_with_backoff(
+            max_attempts=2,
+            backoff=backoff,
+            retryable_exceptions=(urllib.error.URLError, TimeoutError, OSError),
+            reraise_last=True,
+        )(_fetch_rest)
+
         t_start = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-                raw_json = resp.read().decode("utf-8")
+            raw_json = reddit_breaker.execute(fetch_with_retries)
             latency_ms = (time.perf_counter() - t_start) * 1000.0
             ops_metrics.record_source_execution("reddit", success=True, latency_ms=latency_ms)
             return self.parse_json_and_persist(raw_json, topic_id=topic.id, db=db, limit=limit)

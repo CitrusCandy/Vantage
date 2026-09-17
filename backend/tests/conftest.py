@@ -1,9 +1,11 @@
+from datetime import datetime
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database.database import Base
+from app.database.models import Topic
 
 
 @pytest.fixture(autouse=True)
@@ -25,3 +27,31 @@ def setup_test_database(monkeypatch):
     monkeypatch.setattr("app.database.database.engine", test_engine)
     yield
     Base.metadata.drop_all(bind=test_engine)
+
+
+@pytest.fixture
+def db_session():
+    """Create a database session using the active test engine."""
+    from app.database import database
+    session = database.SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture
+def sample_topic(db_session):
+    """Create a sample Topic in the database."""
+    topic = Topic(
+        title="Artificial Intelligence Regulation",
+        slug="artificial-intelligence-regulation",
+        search_count=0,
+        trending_score=0.0,
+        source_coverage={},
+        updated_at=datetime.utcnow(),
+    )
+    db_session.add(topic)
+    db_session.commit()
+    db_session.refresh(topic)
+    return topic

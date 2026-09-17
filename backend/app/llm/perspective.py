@@ -115,37 +115,50 @@ Instructions:
             },
         )
 
-        t_start = time.perf_counter()
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
-                choice = resp_data["choices"][0]["message"]["content"]
-                parsed_json = json.loads(choice)
-                raw_output = PerspectiveSynthesisOutput.model_validate(parsed_json)
-                # Sanitize all quote URLs for security
-                for p in raw_output.perspectives:
-                    for q in p.sample_quotes:
-                        q.url = sanitize_url(q.url)
+        from app.core.resilience import BackoffStrategy, JitterMode, openai_breaker, retry_with_backoff
+
+        def _do_openai_call():
+            t_start = time.perf_counter()
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    choice = resp_data["choices"][0]["message"]["content"]
+                    parsed_json = json.loads(choice)
+                    raw_output = PerspectiveSynthesisOutput.model_validate(parsed_json)
+                    # Sanitize all quote URLs for security
+                    for p in raw_output.perspectives:
+                        for q in p.sample_quotes:
+                            q.url = sanitize_url(q.url)
+                    latency_ms = (time.perf_counter() - t_start) * 1000.0
+                    ops_metrics.record_source_execution("openai", success=True, latency_ms=latency_ms)
+                    return raw_output
+            except urllib.error.HTTPError as e:
                 latency_ms = (time.perf_counter() - t_start) * 1000.0
-                ops_metrics.record_source_execution("openai", success=True, latency_ms=latency_ms)
-                return raw_output
-        except urllib.error.HTTPError as e:
-            latency_ms = (time.perf_counter() - t_start) * 1000.0
-            err_body = e.read().decode("utf-8", errors="ignore")
-            ops_metrics.record_source_execution("openai", success=False, latency_ms=latency_ms, error_summary=f"HTTP {e.code}")
-            logger.error("OpenAI Chat Completion error HTTP %d: %s", e.code, err_body)
-            raise RuntimeError(f"OpenAI Perspective API error HTTP {e.code}: {err_body}") from e
-        except urllib.error.URLError as e:
-            latency_ms = (time.perf_counter() - t_start) * 1000.0
-            is_to = "timed out" in str(e).lower()
-            ops_metrics.record_source_execution("openai", success=False, latency_ms=latency_ms, is_timeout=is_to, error_summary=str(e)[:100])
-            logger.error("OpenAI connection failed: %s", str(e))
-            raise RuntimeError(f"OpenAI connection error: {str(e)}") from e
-        except json.JSONDecodeError as e:
-            latency_ms = (time.perf_counter() - t_start) * 1000.0
-            ops_metrics.record_source_execution("openai", success=False, latency_ms=latency_ms, error_summary="Malformed JSON")
-            logger.error("Failed to parse JSON response from LLM: %s", str(e))
-            raise RuntimeError(f"Malformed JSON from LLM: {str(e)}") from e
+                err_body = e.read().decode("utf-8", errors="ignore")
+                ops_metrics.record_source_execution("openai", success=False, latency_ms=latency_ms, error_summary=f"HTTP {e.code}")
+                logger.error("OpenAI Chat Completion error HTTP %d: %s", e.code, err_body)
+                raise RuntimeError(f"OpenAI Perspective API error HTTP {e.code}: {err_body}") from e
+            except urllib.error.URLError as e:
+                latency_ms = (time.perf_counter() - t_start) * 1000.0
+                is_to = "timed out" in str(e).lower()
+                ops_metrics.record_source_execution("openai", success=False, latency_ms=latency_ms, is_timeout=is_to, error_summary=str(e)[:100])
+                logger.error("OpenAI connection failed: %s", str(e))
+                raise RuntimeError(f"OpenAI connection error: {str(e)}") from e
+            except json.JSONDecodeError as e:
+                latency_ms = (time.perf_counter() - t_start) * 1000.0
+                ops_metrics.record_source_execution("openai", success=False, latency_ms=latency_ms, error_summary="Malformed JSON")
+                logger.error("Failed to parse JSON response from LLM: %s", str(e))
+                raise RuntimeError(f"Malformed JSON from LLM: {str(e)}") from e
+
+        backoff = BackoffStrategy(base_delay=1.0, max_delay=8.0, multiplier=2.0, jitter_mode=JitterMode.FULL)
+        call_with_retries = retry_with_backoff(
+            max_attempts=3,
+            backoff=backoff,
+            retryable_exceptions=(RuntimeError, TimeoutError, OSError),
+            reraise_last=True,
+        )(_do_openai_call)
+
+        return openai_breaker.execute(call_with_retries)
 
     @staticmethod
     def _format_prompt_input(

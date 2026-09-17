@@ -117,13 +117,22 @@ class TrendDiscoveryService:
 
         candidates_map: Dict[str, CandidateTopic] = {}
 
+        from app.core.resilience import trend_discovery_breaker
+
+        if not trend_discovery_breaker.allow_request():
+            logger.warning("[trend_discovery] Circuit breaker is OPEN. Short-circuiting trend discovery.")
+            return []
+
+        def _safe_discover(p: BaseTrendProvider) -> List[str]:
+            try:
+                return p.discover_candidates(limit=limit_per_provider, timeout_seconds=timeout_seconds)
+            except Exception as e:
+                logger.error("Trend provider [%s] failed during discovery: %s", p.source_name, str(e))
+                return []
+
         with ThreadPoolExecutor(max_workers=len(self.providers) or 1) as executor:
             future_to_provider = {
-                executor.submit(
-                    p.discover_candidates,
-                    limit=limit_per_provider,
-                    timeout_seconds=timeout_seconds,
-                ): p
+                executor.submit(_safe_discover, p): p
                 for p in self.providers
             }
 
@@ -156,6 +165,7 @@ class TrendDiscoveryService:
                         str(e),
                     )
 
+        trend_discovery_breaker.record_success()
         results = list(candidates_map.values())
         # Sort by multi-source confidence descending
         results.sort(key=lambda c: len(c.sources), reverse=True)

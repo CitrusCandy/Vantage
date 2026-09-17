@@ -120,18 +120,36 @@ class PerspectivePipeline:
                     "representative_samples": other_samples[: self.max_samples_per_cluster],
                 })
 
-        # 3. Call LLM Synthesizer
+        # 3. Call LLM Synthesizer (with graceful degradation fallback)
         with tracker.track("llm_structured_inference", cluster_count=len(prepared_clusters)):
             logger.info(
                 "Invoking LLM synthesizer for topic '%s' with %d clusters",
                 topic.title,
                 len(prepared_clusters),
             )
-            synthesis_output: PerspectiveSynthesisOutput = self.synthesizer.synthesize(
-                topic_title=topic.title,
-                cluster_payloads=prepared_clusters,
-                total_sample_size=total_sample_size,
-            )
+            try:
+                synthesis_output: PerspectiveSynthesisOutput = self.synthesizer.synthesize(
+                    topic_title=topic.title,
+                    cluster_payloads=prepared_clusters,
+                    total_sample_size=total_sample_size,
+                )
+            except Exception as synth_err:
+                logger.warning(
+                    "LLM synthesis failed for topic '%s' (%s). Falling back to extractive fallback synthesis.",
+                    topic.title,
+                    str(synth_err),
+                )
+                from app.llm.perspective import MockPerspectiveSynthesizer
+                fallback_synth = MockPerspectiveSynthesizer()
+                synthesis_output = fallback_synth.synthesize(
+                    topic_title=topic.title,
+                    cluster_payloads=prepared_clusters,
+                    total_sample_size=total_sample_size,
+                )
+                synthesis_output.confidence_note = (
+                    f"Generated via fail-soft extractive fallback due to upstream provider degradation: {str(synth_err)[:100]}"
+                )
+
             # Track synthesis cost (estimate tokens from cluster payload size)
             total_samples = sum(len(c.get("representative_samples", [])) for c in prepared_clusters)
             estimated_input = total_samples * 50  # ~50 tokens per sample estimate

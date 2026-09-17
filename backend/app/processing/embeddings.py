@@ -63,6 +63,12 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         except ImportError:
             pass
 
+        from app.core.resilience import BackoffStrategy, JitterMode, embeddings_breaker, retry_with_backoff
+
+        if not embeddings_breaker.allow_request():
+            logger.warning("[embeddings] Circuit breaker is OPEN. Fast-failing embedding request.")
+            raise RuntimeError("Circuit breaker 'embeddings' is OPEN")
+
         all_embeddings: List[List[float]] = []
 
         for i in range(0, len(texts), batch_size):
@@ -85,28 +91,39 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
                 },
             )
 
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                    resp_data = json.loads(resp.read().decode("utf-8"))
-                    # OpenAI returns data objects with index and embedding
-                    items = sorted(resp_data.get("data", []), key=lambda x: x["index"])
-                    batch_embeddings = [item["embedding"] for item in items]
-                    all_embeddings.extend(batch_embeddings)
-            except urllib.error.HTTPError as e:
-                err_body = e.read().decode("utf-8", errors="ignore")
-                logger.error(
-                    "OpenAI API error (HTTP %d): %s - Body: %s",
-                    e.code,
-                    str(e),
-                    err_body,
-                )
-                raise RuntimeError(f"OpenAI Embedding API error HTTP {e.code}: {err_body}") from e
-            except urllib.error.URLError as e:
-                logger.error("OpenAI API network/timeout error: %s", str(e))
-                raise RuntimeError(f"OpenAI Embedding connection failed: {str(e)}") from e
-            except Exception as e:
-                logger.error("Unexpected error during OpenAI embedding generation: %s", str(e))
-                raise RuntimeError(f"Unexpected embedding error: {str(e)}") from e
+            def _fetch_batch():
+                try:
+                    with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                        resp_data = json.loads(resp.read().decode("utf-8"))
+                        # OpenAI returns data objects with index and embedding
+                        items = sorted(resp_data.get("data", []), key=lambda x: x["index"])
+                        return [item["embedding"] for item in items]
+                except urllib.error.HTTPError as e:
+                    err_body = e.read().decode("utf-8", errors="ignore")
+                    logger.error(
+                        "OpenAI API error (HTTP %d): %s - Body: %s",
+                        e.code,
+                        str(e),
+                        err_body,
+                    )
+                    raise RuntimeError(f"OpenAI Embedding API error HTTP {e.code}: {err_body}") from e
+                except urllib.error.URLError as e:
+                    logger.error("OpenAI API network/timeout error: %s", str(e))
+                    raise RuntimeError(f"OpenAI Embedding connection failed: {str(e)}") from e
+                except Exception as e:
+                    logger.error("Unexpected error during OpenAI embedding generation: %s", str(e))
+                    raise RuntimeError(f"Unexpected embedding error: {str(e)}") from e
+
+            backoff = BackoffStrategy(base_delay=0.5, max_delay=4.0, multiplier=2.0, jitter_mode=JitterMode.FULL)
+            fetch_with_retries = retry_with_backoff(
+                max_attempts=3,
+                backoff=backoff,
+                retryable_exceptions=(RuntimeError, TimeoutError, OSError),
+                reraise_last=True,
+            )(_fetch_batch)
+
+            batch_embeddings = embeddings_breaker.execute(fetch_with_retries)
+            all_embeddings.extend(batch_embeddings)
 
         return all_embeddings
 

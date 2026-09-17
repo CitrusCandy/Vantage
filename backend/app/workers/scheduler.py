@@ -4,6 +4,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
+from app.core.resilience import CancellationToken
 from app.workers.jobs import run_trending_refresh_job
 from app.workers.worker_config import WorkerConfig, get_worker_config
 
@@ -27,6 +28,7 @@ class BackgroundScheduler:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self.cancellation_token = CancellationToken()
         self.last_run_time: Optional[datetime] = None
         self.last_run_result: Optional[Dict[str, Any]] = None
         self.last_error: Optional[str] = None
@@ -48,6 +50,15 @@ class BackgroundScheduler:
                 return
 
             self._stop_event.clear()
+            self.cancellation_token = CancellationToken()
+
+            # Startup orphan recovery
+            try:
+                from app.database.backup import release_backup_lock
+                release_backup_lock()
+            except Exception as e:
+                logger.debug("Startup lock cleanup: %s", e)
+
             self._thread = threading.Thread(
                 target=self._run_loop,
                 args=(auto_discover, run_immediately),
@@ -58,12 +69,13 @@ class BackgroundScheduler:
             logger.info("BackgroundScheduler started (interval=%.1fh)", self.config.worker_interval_hours)
 
     def stop(self, timeout_seconds: float = 5.0) -> None:
-        """Signal the scheduler thread to stop and wait for it to join."""
+        """Signal the scheduler thread to stop, cancel in-flight token, and wait for it to join."""
         with self._lock:
             if not self.is_running:
                 return
 
             self._stop_event.set()
+            self.cancellation_token.cancel("scheduler shutdown")
 
         if self._thread:
             self._thread.join(timeout=timeout_seconds)
@@ -73,6 +85,13 @@ class BackgroundScheduler:
         gov = _get_concurrency_governor()
         if gov:
             gov.release_all()
+
+        # Release backup lock if held
+        try:
+            from app.database.backup import release_backup_lock
+            release_backup_lock()
+        except Exception:
+            pass
 
     def run_scheduled_backup(self) -> Optional[Dict[str, Any]]:
         """Execute a scheduled database backup with fail-soft isolation."""

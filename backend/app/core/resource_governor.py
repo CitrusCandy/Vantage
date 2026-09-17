@@ -761,19 +761,33 @@ class GovernanceCoordinator:
             logger.warning("GovernanceCoordinator: Redis unavailable (%s). Falling back to in-memory coordination.", self._last_error)
 
     def _execute(self, method_name: str, *args, **kwargs) -> Any:
-        """Execute method on active store with automatic fallback on failure."""
+        """Execute method on active store with automatic fallback on failure and circuit breaker tracking."""
+        from app.core.resilience import redis_governance_breaker
+
+        # Periodic auto-recovery probe if fallback was active and breaker allows request
+        if self._backend_type == "redis" and self._fallback_active:
+            if redis_governance_breaker.allow_request():
+                try:
+                    self._init_redis()
+                except Exception:
+                    pass
+
         if self._backend_type == "redis" and self.redis_store is not None and not self._fallback_active:
-            try:
-                method = getattr(self.redis_store, method_name)
-                return method(*args, **kwargs)
-            except Exception as e:
-                now = time.monotonic()
-                if now - self._last_log_time > 30.0:
-                    logger.warning("Redis governance error on %s: %s. Falling back to in-process memory store.", method_name, str(e)[:100])
-                    self._last_log_time = now
-                self._last_error = str(e)[:100]
-                if self._fallback_allowed:
-                    self._fallback_active = True
+            if redis_governance_breaker.allow_request():
+                try:
+                    method = getattr(self.redis_store, method_name)
+                    res = method(*args, **kwargs)
+                    redis_governance_breaker.record_success()
+                    return res
+                except Exception as e:
+                    redis_governance_breaker.record_failure(e)
+                    now = time.monotonic()
+                    if now - self._last_log_time > 30.0:
+                        logger.warning("Redis governance error on %s: %s. Falling back to in-process memory store.", method_name, str(e)[:100])
+                        self._last_log_time = now
+                    self._last_error = str(e)[:100]
+                    if self._fallback_allowed:
+                        self._fallback_active = True
 
         # In-memory execution
         method = getattr(self.in_memory_store, method_name)
@@ -781,6 +795,7 @@ class GovernanceCoordinator:
 
     def get_backend_info(self) -> Dict[str, Any]:
         """Return operational metadata about active governance backend."""
+        from app.core.resilience import redis_governance_breaker
         is_redis_target = self._backend_type == "redis"
         active_name = "redis" if (is_redis_target and not self._fallback_active and self.redis_store is not None) else "memory"
         is_healthy = self.in_memory_store.is_healthy() if active_name == "memory" else (self.redis_store.is_healthy() if self.redis_store else False)
@@ -792,12 +807,15 @@ class GovernanceCoordinator:
             "fallback_active": self._fallback_active,
             "fallback_allowed": self._fallback_allowed,
             "redis_configured": is_redis_target,
+            "circuit_state": redis_governance_breaker.state.value,
             "last_error": self._last_error,
         }
 
     def reset_fallback(self) -> bool:
         """Attempt to reconnect to Redis and reset fallback state."""
+        from app.core.resilience import redis_governance_breaker
         if self._backend_type == "redis":
+            redis_governance_breaker.reset()
             self._init_redis()
             return not self._fallback_active
         return True

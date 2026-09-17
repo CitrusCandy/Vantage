@@ -142,3 +142,25 @@ During an infrastructure incident or data recovery event:
    - Verify topics count and recent pipeline runs in `/ops`.
 6. **Resume Background Workers**:
    - Re-enable background workers once schema integrity is verified.
+
+---
+
+## 8. Dependency Outage & Degraded Mode Runbooks
+
+### 8.1 Circuit Breaker Inspection & Manual Reset
+When a third-party service suffers an outage, its corresponding circuit breaker transitions to `OPEN`, immediately short-circuiting downstream calls to protect worker threads:
+- **Inspect States**: `GET /api/ops/resilience` returns current state (`CLOSED`, `OPEN`, `HALF_OPEN`), failure counters, and retry countdown.
+- **Manual Reset**: `POST /api/ops/resilience/reset` (with `X-Ops-Key`) forces all circuit breakers to `CLOSED` and reconnects shared governance.
+
+### 8.2 Redis / Shared Governance Outage Runbook
+If Redis crashes or encounters network partitioning:
+1. **Automatic Failover**: `GovernanceCoordinator` automatically switches to in-process memory store with zero dropped requests.
+2. **Degraded Signal**: `/ready` and `/api/ops/overview` return `status: "degraded"`.
+3. **Recovery**: Once Redis recovers, probe calls automatically restore distributed coordination, or operators can trigger `POST /api/ops/resilience/reset`.
+
+### 8.3 LLM Provider Outage Runbook
+If OpenAI API experiences elevated errors or HTTP 429 quota exhaustion:
+1. **Circuit Tripping**: `openai_synthesis` breaker trips to `OPEN`.
+2. **Extractive Fallback**: Pipeline automatically synthesizes briefs from top representative discourse clusters, tagging perspectives with a fail-soft confidence note.
+3. **Zero State Corruption**: Existing valid perspectives are preserved or updated gracefully with zero unhandled 500 errors.
+

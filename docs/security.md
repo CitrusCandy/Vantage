@@ -102,3 +102,12 @@ The CI quality gate and local `scripts/verify_release.py` automatically scan all
 - **Zero-Secret Redis Configuration & Operational API Protection**:
   - Redis connection URLs and credentials are loaded exclusively from private environment variables (`REDIS_URL`) and are never exposed in logs, error payloads, or API responses.
   - `GET /api/ops/resource-usage` and `GET /api/ops/resource-budgets` are protected by the existing `X-Ops-Key` guard and only expose sanitized backend status flags (`backend_type`, `is_fallback_active`).
+
+---
+
+## 9. Fail-Safe Resilience, Circuit Breaking & Sanitized Health Probes
+
+- **Sanitized Liveness & Readiness Signals**: `/health` and `/ready` report component states (`healthy`, `degraded`, `unready`) without exposing DB connection strings, Redis auth tokens, or internal stack traces.
+- **Circuit Breaker Fast-Failing**: Prevents connection pool starvation and socket exhaustion during upstream third-party outages by fast-failing before network operations are initiated.
+- **Bounded Exponential Backoff with Jitter**: Protects upstream providers from accidental distributed denial-of-service (DDoS) loops or thundering herds during retry storms.
+- **Cooperative Cancellation**: Prevents runaway threads or leaked database transactions on client disconnection or worker termination.

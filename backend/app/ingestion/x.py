@@ -128,6 +128,12 @@ class XScraper:
         timeout_seconds: float = 10.0,
     ) -> List[RawX]:
         """Scrape X with fail-soft isolation. Never throws to downstream pipeline."""
+        from app.core.resilience import BackoffStrategy, JitterMode, x_breaker, retry_with_backoff
+
+        if not x_breaker.allow_request():
+            logger.warning("[x] Circuit breaker is OPEN. Short-circuiting request for topic '%s'", topic.title)
+            return []
+
         logger.info(
             "Fetching [x] posts for topic '%s' (ID %d, limit=%d, timeout=%.1fs)",
             topic.title,
@@ -135,15 +141,22 @@ class XScraper:
             limit,
             timeout_seconds,
         )
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                # Fail-soft network execution / Selenium browser session placeholder
-                # Without credentials/live browser in testing/offline, safely returns empty without crashing
-                return []
-            except Exception as e:
-                logger.warning("[x] Attempt %d/%d failed: %s", attempt, self.max_retries, str(e))
-                if attempt < self.max_retries:
-                    time.sleep(self.backoff_seconds * attempt)
 
-        logger.error("[x] Fail-soft: X ingestion failed gracefully for topic '%s'", topic.title)
-        return []
+        backoff = BackoffStrategy(base_delay=self.backoff_seconds, max_delay=5.0, multiplier=2.0, jitter_mode=JitterMode.FULL)
+        
+        def _scrape_attempt():
+            # Fail-soft network execution / Selenium browser session placeholder
+            # Without credentials/live browser in testing/offline, safely returns empty without crashing
+            return []
+
+        scrape_with_retries = retry_with_backoff(
+            max_attempts=self.max_retries,
+            backoff=backoff,
+            reraise_last=True,
+        )(_scrape_attempt)
+
+        try:
+            return x_breaker.execute(scrape_with_retries)
+        except Exception as e:
+            logger.error("[x] Fail-soft: X ingestion failed gracefully for topic '%s': %s", topic.title, str(e))
+            return []

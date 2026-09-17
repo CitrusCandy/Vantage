@@ -292,6 +292,21 @@ python -m app.database.restore --backup backups/vantage_backup_20260916_205500.s
 
 ---
 
+## Resilience, Fault Tolerance & Graceful Degradation
+
+Vantage News provides mission-critical fault tolerance across all external integrations and platform dependencies:
+
+1. **Bounded Retries with Jitter**: Exponential backoff with configurable jitter (`full`, `equal`, `decorrelated`) prevents retry storms against third-party providers.
+2. **Circuit Breaker State Machine**: Circuit breakers (`CLOSED`, `OPEN`, `HALF_OPEN`) protect all provider boundaries (`google_news`, `reddit`, `x`, `openai_synthesis`, `embeddings`, `redis_governance`, `trend_discovery`). Fast-fails immediately when `OPEN` to conserve worker threads.
+3. **Graceful Degradation Fallbacks**:
+   - Partial scraper failures merge remaining sources cleanly without state corruption.
+   - LLM outages fall back to fail-soft extractive summaries with clear degradation notices.
+   - Redis disruptions fall back to in-process memory governance with zero dropped requests.
+4. **Cooperative Cancellation & Timeouts**: `CancellationToken` and bounded timeouts ensure graceful worker shutdown without leaked locks or orphan threads.
+5. **Sanitized Health Signals**: `/health` (liveness) and `/ready` (readiness) report `healthy`, `degraded`, or `unready` without exposing database secrets.
+
+---
+
 ## Automated Quality Gates & Incident Readiness Checklist
 
 Before pushing changes or deploying to production, execute the automated verification gates:
@@ -306,12 +321,13 @@ python scripts/incident_readiness.py
 # 3. Run disaster recovery & backup readiness checklist
 python scripts/disaster_recovery_check.py
 
-# 4. Run complete backend test suite (100% offline, deterministic)
+# 4. Run complete backend test suite (203+ unit, integration & resilience tests)
 pytest backend/tests/ -v
 
 # 5. Verify frontend production compilation
 cd frontend && npm run build
 ```
+
 
 
 

@@ -61,10 +61,27 @@ class GoogleNewsIngestor:
         }
         req = urllib.request.Request(rss_url, headers=headers)
 
+        from app.core.resilience import BackoffStrategy, JitterMode, google_news_breaker, retry_with_backoff
+
+        if not google_news_breaker.allow_request():
+            logger.warning("[google_news] Circuit breaker is OPEN. Short-circuiting request for topic '%s'", topic.title)
+            return []
+
+        def _fetch():
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+                return response.read()
+
+        backoff = BackoffStrategy(base_delay=0.3, max_delay=3.0, multiplier=2.0, jitter_mode=JitterMode.FULL)
+        fetch_with_retries = retry_with_backoff(
+            max_attempts=2,
+            backoff=backoff,
+            retryable_exceptions=(urllib.error.URLError, TimeoutError, OSError),
+            reraise_last=True,
+        )(_fetch)
+
         t_start = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-                content = response.read()
+            content = google_news_breaker.execute(fetch_with_retries)
             latency_ms = (time.perf_counter() - t_start) * 1000.0
             ops_metrics.record_source_execution("google_news", success=True, latency_ms=latency_ms)
         except Exception as e:
