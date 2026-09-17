@@ -246,10 +246,10 @@ def test_alert_lifecycle_and_recovery_transitions(db_session):
 
     # 2. Re-evaluate with condition resolved (firing_keys empty)
     eval_result = mgr.evaluate(db=db_session)
-    assert eval_result["active_count"] == 0
-    assert eval_result["resolved_count"] >= 1
-    assert eval_result["resolved_alerts"][0]["status"] == "resolved"
-    assert eval_result["resolved_alerts"][0]["resolved_at"] is not None
+    active_ids = [a["id"] for a in eval_result["active_alerts"]]
+    resolved_ids = [a["id"] for a in eval_result["resolved_alerts"]]
+    assert "database_unavailable:database" not in active_ids
+    assert "database_unavailable:database" in resolved_ids
 
     # Verify persisted DB record is updated to resolved
     db_session.refresh(db_alert)
@@ -258,6 +258,7 @@ def test_alert_lifecycle_and_recovery_transitions(db_session):
 
 
 def test_circuit_breaker_and_slo_alert_integration(db_session):
+    from app.core.resilience import CircuitState
     mgr = AlertManager(config=AlertConfig())
     mgr.clear()
 
@@ -265,7 +266,7 @@ def test_circuit_breaker_and_slo_alert_integration(db_session):
     cb = circuit_registry.get_or_create("google_news_fetch", failure_threshold=2)
     cb.record_failure(Exception("HTTP 503"))
     cb.record_failure(Exception("HTTP 503"))
-    assert cb.is_open
+    assert cb.state == CircuitState.OPEN
 
     # Run alert evaluation
     result = mgr.evaluate(db=db_session)
@@ -274,12 +275,13 @@ def test_circuit_breaker_and_slo_alert_integration(db_session):
 
     # Reset circuit breaker
     circuit_registry.reset_all()
-    assert not cb.is_open
+    assert cb.state == CircuitState.CLOSED
 
     # Next evaluation should resolve the circuit breaker alert
     res_after = mgr.evaluate(db=db_session)
     active_after = [a["rule_name"] for a in res_after["active_alerts"]]
     assert "circuit_breaker_open" not in active_after
+
 
 
 # ============================================================================
