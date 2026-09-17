@@ -304,8 +304,39 @@ export async function getPlatformMetrics(): Promise<import("./types").PlatformMe
   return fetchJson<import("./types").PlatformMetricsResponse>("/ops/metrics", {}, "getPlatformMetrics");
 }
 
+export async function getSecurityAuditLogs(params?: {
+  action?: string;
+  actor?: string;
+  status?: string;
+  start_time?: string;
+  end_time?: string;
+  page?: number;
+  limit?: number;
+  apiKey?: string;
+}): Promise<import("./types").SecurityAuditLogsResponse> {
+  const queryParts: string[] = [];
+  if (params?.action) queryParts.push(`action=${encodeURIComponent(params.action)}`);
+  if (params?.actor) queryParts.push(`actor=${encodeURIComponent(params.actor)}`);
+  if (params?.status) queryParts.push(`status=${encodeURIComponent(params.status)}`);
+  if (params?.start_time) queryParts.push(`start_time=${encodeURIComponent(params.start_time)}`);
+  if (params?.end_time) queryParts.push(`end_time=${encodeURIComponent(params.end_time)}`);
+  if (params?.page) queryParts.push(`page=${params.page}`);
+  if (params?.limit) queryParts.push(`limit=${params.limit}`);
+
+  const qs = queryParts.length > 0 ? `?${queryParts.join("&")}` : "";
+  const headers: Record<string, string> = {};
+  if (params?.apiKey) headers["X-Ops-Key"] = params.apiKey;
+
+  return fetchJson<import("./types").SecurityAuditLogsResponse>(
+    `/ops/audit-logs${qs}`,
+    { headers },
+    "getSecurityAuditLogs",
+  );
+}
+
 /** Utility: get minimum safe polling interval in ms. */
 export function getMinPollIntervalMs(): number {
   return MIN_POLL_INTERVAL_MS;
 }
+
 

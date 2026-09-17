@@ -450,3 +450,29 @@ export interface PlatformMetricsResponse {
   metrics: Record<string, MetricDefinition>;
 }
 
+export interface SecurityAuditLogEntry {
+  id: number;
+  timestamp: string;
+  actor: string;
+  role: string;
+  action: string;
+  resource?: string | null;
+  ip_address?: string | null;
+  user_agent?: string | null;
+  status: "allowed" | "denied" | "failed" | "error" | string;
+  details: Record<string, any>;
+  error_message?: string | null;
+}
+
+export interface SecurityAuditLogsResponse {
+  status: string;
+  page: number;
+  limit: number;
+  total_count: number;
+  total_pages: number;
+  has_next: boolean;
+  has_prev: boolean;
+  audit_logs: SecurityAuditLogEntry[];
+}
+
+
