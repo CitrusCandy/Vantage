@@ -25,7 +25,25 @@ def setup_test_database(monkeypatch):
 
     monkeypatch.setattr("app.database.database.SessionLocal", TestingSessionLocal)
     monkeypatch.setattr("app.database.database.engine", test_engine)
+
+    try:
+        from app.core.metrics import platform_metrics
+        from app.core.resilience import circuit_registry
+        platform_metrics.reset_all()
+        circuit_registry.reset_all()
+    except Exception:
+        pass
+
     yield
+
+    try:
+        from app.core.metrics import platform_metrics
+        from app.core.resilience import circuit_registry
+        platform_metrics.reset_all()
+        circuit_registry.reset_all()
+    except Exception:
+        pass
+
     Base.metadata.drop_all(bind=test_engine)
 
 

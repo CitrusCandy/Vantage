@@ -587,12 +587,13 @@ class AlertManager:
         message: str,
         metadata: Dict[str, Any],
         firing_keys: Set[str],
-        now_ts: float,
+        now_ts: Optional[float] = None,
         db: Optional[Session] = None,
     ):
         """Thread-safe deduplication, cooldown registration, and database persistence for active alerts."""
         alert_id = f"{rule_name}:{component}"
         firing_keys.add(alert_id)
+        current_ts = now_ts if now_ts is not None else time.time()
         now_dt = datetime.now(timezone.utc)
         now_iso = now_dt.isoformat()
         sanitized_msg = mask_sensitive_data(message)

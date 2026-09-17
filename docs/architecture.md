@@ -119,3 +119,33 @@ X ────────────┘
     - **Graceful Worker Lifecycle**: Background scheduler cleans up all held locks, concurrency slots, and heartbeat keys on shutdown (`SIGINT`/`SIGTERM`), and safely reclaims orphaned locks on startup.
     - **Enriched Health/Readiness Probes**: `/health` (liveness) and `/ready` (readiness) accurately distinguish `healthy`, `degraded` (circuit open or Redis fallback active), and `unready` (database unreachable) without exposing secrets.
 
+12. **Observability, SLOs, Metrics & Automated Alerting** (`app.core.metrics`, `app.core.slo`, `app.core.alerting`):
+    - **Low-Cardinality Structured Metrics Registry**:
+      - Thread-safe metric primitives: `CounterMetric`, `GaugeMetric`, and `HistogramMetric`.
+      - Strict memory bounds: label combinations capped at 200 to eliminate high-cardinality label explosion risks.
+      - Sliding-window percentiles ($P_{50}, P_{90}, P_{95}, P_{99}$, mean, min, max, sum, count) for HTTP API, pipeline execution, source scrapers, and database queries.
+      - Prometheus Exposition: `/metrics` endpoint exports standard Prometheus text metrics.
+    - **Service Level Objectives (SLOs) & SLI Engine**:
+      - 9 Platform SLOs tracked with real-time compliance evaluation:
+        1. `api_availability`: Target $\ge 99.9\%$ (HTTP non-5xx requests)
+        2. `api_latency_p95`: Target $\le 250\text{ ms}$ (95th percentile API response time)
+        3. `ingestion_freshness`: Target $\le 1800\text{ s}$ ($30\text{ min}$ freshness)
+        4. `pipeline_success_rate`: Target $\ge 99.0\%$ (Discourse pipeline completions)
+        5. `provider_health`: Target $\ge 95.0\%$ (External scrapers success rate)
+        6. `worker_liveness`: Target $\ge 99.5\%$ (Background scheduler active heartbeats)
+        7. `database_query_p95`: Target $\le 50\text{ ms}$ (95th percentile database latency)
+        8. `redis_governance_uptime`: Target $\ge 99.9\%$ (Native Redis vs memory fallback)
+        9. `resource_budget_compliance`: Target $\ge 95.0\%$ (Operations operating within safety ceilings)
+      - Real-time Error Budget calculation (% remaining) and multi-window burn rate tracking ($1\times, 2\times, 5\times, 14.4\times$).
+      - Historical violation tracking persisted in `slo_violation_records` table.
+    - **Automated Alerting Lifecycle & Flapping Suppression**:
+      - Multi-domain alert evaluation: Database health, worker liveness, source error spikes, pipeline latency, open circuit breakers, and SLO violations.
+      - Transition tracking with automatic structured recovery events (`alert_recovered`).
+      - Rapid transition suppression (flapping prevention) ensuring alerts do not storm during transient blips.
+    - **Ops API & Frontend Observability Dashboard**:
+      - `GET /api/ops/slos`: Exposes full SLO status, error budgets, health score, and burn rates.
+      - `GET /api/ops/metrics`: Exposes JSON snapshot of all platform metric distributions.
+      - `GET /metrics`: Standard Prometheus metrics exporter.
+      - Frontend `/ops` Dashboard: Real-time SLO cards, error budget progress bars, burn rate badges, and live latency percentiles viewer.
+
+

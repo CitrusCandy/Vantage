@@ -40,6 +40,10 @@ class TestProductionAlertingEngine(unittest.TestCase):
         # Reset singleton state before each test
         alert_manager.clear()
         ops_metrics.recent_runs.clear()
+        from app.core.metrics import platform_metrics
+        from app.core.resilience import circuit_registry
+        platform_metrics.reset_all()
+        circuit_registry.reset_all()
         for src in ops_metrics.source_health.values():
             src.success_count = 0
             src.failure_count = 0
@@ -52,6 +56,10 @@ class TestProductionAlertingEngine(unittest.TestCase):
 
     def tearDown(self):
         alert_manager.clear()
+        from app.core.metrics import platform_metrics
+        from app.core.resilience import circuit_registry
+        platform_metrics.reset_all()
+        circuit_registry.reset_all()
         app.dependency_overrides.clear()
         self.db.close()
         Base.metadata.drop_all(bind=self.engine)

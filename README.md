@@ -303,7 +303,18 @@ Vantage News provides mission-critical fault tolerance across all external integ
    - LLM outages fall back to fail-soft extractive summaries with clear degradation notices.
    - Redis disruptions fall back to in-process memory governance with zero dropped requests.
 4. **Cooperative Cancellation & Timeouts**: `CancellationToken` and bounded timeouts ensure graceful worker shutdown without leaked locks or orphan threads.
-5. **Sanitized Health Signals**: `/health` (liveness) and `/ready` (readiness) report `healthy`, `degraded`, or `unready` without exposing database secrets.
+## Observability, SLOs, Metrics & Prometheus Exposition
+
+Vantage News provides comprehensive production observability with bounded low-cardinality metrics, real-time Service Level Objective (SLO) compliance, error budget tracking, and Prometheus exposition:
+
+1. **Prometheus Exporter (`/metrics`)**: Standard Prometheus exposition format exposing all platform counters, gauges, and histograms.
+2. **Platform Metrics API (`GET /api/ops/metrics`)**: JSON snapshot of all registered platform metrics and rolling sliding-window percentiles ($P_{50}, P_{90}, P_{95}, P_{99}$).
+3. **SLO Engine (`GET /api/ops/slos`)**: Tracks 9 core platform reliability objectives:
+   - `api_availability` ($\ge 99.9\%$), `api_latency_p95` ($\le 250\text{ ms}$), `ingestion_freshness` ($\le 1800\text{ s}$)
+   - `pipeline_success_rate` ($\ge 99.0\%$), `provider_health` ($\ge 95.0\%$), `worker_liveness` ($\ge 99.5\%$)
+   - `database_query_p95` ($\le 50\text{ ms}$), `redis_governance_uptime` ($\ge 99.9\%$), `resource_budget_compliance` ($\ge 95.0\%$)
+4. **Error Budget & Burn Rates**: Evaluates remaining error budget percentage and multi-window burn rate multipliers ($1\times, 2\times, 5\times, 14.4\times$) with persistent violation logging.
+5. **Interactive Dashboard**: Modern `/ops` interface visualizing SLO health scores, error budget progress bars, burn rate badges, and live latency percentiles.
 
 ---
 
@@ -321,12 +332,13 @@ python scripts/incident_readiness.py
 # 3. Run disaster recovery & backup readiness checklist
 python scripts/disaster_recovery_check.py
 
-# 4. Run complete backend test suite (203+ unit, integration & resilience tests)
+# 4. Run complete backend test suite (215 unit, integration, resilience, and observability tests)
 pytest backend/tests/ -v
 
 # 5. Verify frontend production compilation
 cd frontend && npm run build
 ```
+
 
 
 
